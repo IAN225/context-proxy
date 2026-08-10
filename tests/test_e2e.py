@@ -113,8 +113,8 @@ def fresh(**summary_overrides) -> None:
 FILLER = "这是一段用于把消息撑到一定长度的中文内容，重复若干次以便控制 token 数量。"
 
 
-def convo(rounds: int, *, start: int = 0, filler: int = 2) -> list[dict]:
-    msgs: list[dict] = [{"role": "system", "content": "你是一个陪伴助手。"}]
+def convo(rounds: int, *, start: int = 0, filler: int = 2, head: bool = True) -> list[dict]:
+    msgs: list[dict] = [{"role": "system", "content": "你是一个陪伴助手。"}] if head else []
     for i in range(start, start + rounds):
         msgs.append({"role": "user", "content": f"【第{i}轮提问】{FILLER * filler}"})
         msgs.append({"role": "assistant", "content": f"【第{i}轮回答】{FILLER * filler}"})
@@ -248,6 +248,95 @@ def test_early_fork_rolls_back_to_a_checkpoint_not_zero():
     added = len(summary_calls()) - n_before
     assert added < n_before, f"回退重压的批次({added})应远少于首次全量({n_before})"
     assert httpx.get(f"{PROXY}/health", timeout=5).json()["fallback_activations"] == 0
+
+
+# ---- 三个开放问题的答案，用测试钉死 ----
+
+def test_summary_goes_under_system_right_before_the_transcript():
+    """答案一：摘要以 system 注入，位置固定在开头 system 之后、近期原文之前。"""
+    fresh()
+    assert post("mm", convo(30)).status_code == 200
+    call = chat_calls()[-1]
+    assert call["roles"][0] == "system", "原有的开头 system 提示要保留在最前"
+    assert call["roles"][1] == "system", "摘要必须以 system 角色注入"
+    assert call["roles"][2] == "user", "摘要之后紧接着就是近期原文"
+    assert "user" not in call["roles"][:2]
+
+    # summary_role 可切到 user，给只允许一条 system 的上游用
+    fresh(summary_role="user")
+    assert post("mm", convo(30)).status_code == 200
+    call = chat_calls()[-1]
+    assert call["roles"][0] == "system" and call["roles"][1] == "user"
+
+
+def test_prefix_stays_byte_stable_between_compressions():
+    """答案二：摘要排在原文之前，两次压缩之间请求前缀逐字节不变，能命中上游 prefix cache。"""
+    fresh()
+    history = convo(30)
+    assert post("mm", history).status_code == 200
+
+    n_summary = len(summary_calls())
+    prefixes = []
+    for k in range(3):
+        history = history + convo(1, start=500 + k, head=False)
+        assert post("mm", history).status_code == 200
+        prefixes.append(chat_calls()[-1]["fp"])
+
+    assert len(summary_calls()) == n_summary, "这几轮不该再触发压缩"
+    for a, b in zip(prefixes, prefixes[1:]):
+        assert b[:len(a)] == a, "新增消息只能追加在尾部，前缀必须原封不动"
+        assert len(b) == len(a) + 2
+    # [0]=原有 system，[1]=摘要，两次请求之间必须完全一致
+    assert prefixes[0][0] == prefixes[-1][0]
+    assert prefixes[0][1] == prefixes[-1][1]
+
+
+def _tool_convo(rounds: int) -> list[dict]:
+    msgs: list[dict] = [{"role": "system", "content": "你是助手。"}]
+    for i in range(rounds):
+        msgs.append({"role": "user", "content": f"【第{i}轮】帮我查一下 {FILLER * 2}"})
+        msgs.append({"role": "assistant", "content": "",
+                     "tool_calls": [{"id": f"call_{i}", "type": "function",
+                                     "function": {"name": "search",
+                                                  "arguments": f'{{"q":"第{i}轮查询"}}'}}]})
+        msgs.append({"role": "tool", "tool_call_id": f"call_{i}",
+                     "content": f"第{i}轮工具返回：{FILLER}"})
+        msgs.append({"role": "assistant", "content": f"【第{i}轮答】{FILLER * 2}"})
+    return msgs
+
+
+def test_tool_call_rounds_are_never_split():
+    """答案三：切点只落在轮边界，assistant(tool_calls) 和它的 tool 返回永不被拆开。"""
+    fresh()
+    history = _tool_convo(25)
+    r = post("mm", history)
+    assert r.status_code == 200, r.text
+    call = chat_calls()[-1]
+
+    # 保留区的第一条必须是 user（轮的起点），不能从半个工具调用中间开始
+    assert call["roles"][1] == "system"          # 摘要
+    assert call["roles"][2] == "user"
+
+    # 上游收到的消息里不能有孤儿 tool
+    seen_assistant = False
+    for role in call["roles"][2:]:
+        if role == "assistant":
+            seen_assistant = True
+        if role == "tool":
+            assert seen_assistant, "tool 消息前面必须有发起调用的 assistant"
+
+    # 送进摘要模型的每一批也都从 user 开始、以 assistant 收束，
+    # 即批边界只落在轮边界上，工具调用四件套不会被拆散
+    for c in summary_calls():
+        transcript = c["prompt"].split("=== 对话片段开始 ===", 1)[-1].strip()
+        transcript = transcript.split("=== 对话片段结束 ===", 1)[0].strip()
+        blocks = [b for b in transcript.split("\n\n") if b.startswith("[")]
+        assert blocks[0].startswith("[user]:"), blocks[0][:80]
+        assert blocks[-1].startswith("[assistant]:"), blocks[-1][:80]
+        # 每个 [tool] 块前面一定紧跟着一个发起调用的 assistant
+        for i, b in enumerate(blocks):
+            if b.startswith("[tool]:"):
+                assert blocks[i - 1].startswith("[assistant]:") and "调用工具" in blocks[i - 1]
 
 
 def test_deep_early_edit_falls_back_with_branch_warning():

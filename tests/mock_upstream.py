@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import threading
 import time
@@ -63,12 +64,18 @@ async def chat(request: Request):
         "model": body.get("model"),
         "n_messages": len(msgs),
         "roles": [m.get("role") for m in msgs],
+        # 逐条 (role, 内容指纹)，用来验证请求前缀在两次压缩之间是否逐字节稳定
+        "fp": [f"{m.get('role')}:"
+               f"{hashlib.sha1(json.dumps(m.get('content'), ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:12]}"
+               for m in msgs],
         "chars": sum(len(json.dumps(m.get("content"), ensure_ascii=False)) for m in msgs),
         "has_image": any(isinstance(m.get("content"), list) and
                          any(isinstance(p, dict) and p.get("type") == "image_url"
                              for p in m["content"]) for m in msgs),
         "system_preview": next((str(m.get("content"))[:120] for m in msgs
                                 if m.get("role") == "system"), None),
+        # 摘要请求的 user prompt（里面是被渲染成文本的那一批原文）
+        "prompt": str(msgs[-1].get("content", ""))[:4000] if msgs else "",
         "stream": bool(body.get("stream")),
     })
 

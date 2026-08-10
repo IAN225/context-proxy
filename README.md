@@ -1,6 +1,6 @@
 # context-proxy
 
-架在 chatbox（Open WebUI 等）和模型 API 之间的 **OpenAI 兼容上下文压缩网关**。
+架在 chatbox 和模型 API 之间的 **OpenAI 兼容上下文压缩网关**。
 长对话超过阈值时，把较早的历史交给便宜的摘要模型压成摘要再转发，抑制 input token 无限累加。
 
 面向陪伴向长对话（单会话可达数千条消息、几百万 token），首要目标是**省钱**和**不出事**：
@@ -17,8 +17,8 @@
 详细设计与取舍见 [docs/design.md](docs/design.md)，排查手册见 [docs/troubleshooting.md](docs/troubleshooting.md)。
 
 ```
-Open WebUI ──> context-proxy :8787/<provider>/v1 ──> 模型 API
-                     └──> 超阈值时调摘要模型压缩较早历史
+chatbox ──> context-proxy :8787/<provider>/v1 ──> 模型 API
+                  └──> 超阈值时调摘要模型压缩较早历史
 ```
 
 ---
@@ -35,7 +35,7 @@ cp config.yaml config.yaml.bak      # 备份后按下面改
 
 ```yaml
 providers:
-  - name: run                        # 决定 URL：/run/v1
+  - name: <provider>                 # 自己起的名字，决定 URL：/<provider>/v1
     base_url: "https://your-gateway/v1"
     api_key: "sk-..."
     multimodal: true                 # 纯文本模型必须设 false，否则带图历史会报错
@@ -53,7 +53,7 @@ summary:
     model: "..."
 
 server:
-  auth_token: "sk-proxy-自定义一个"   # Open WebUI 里填这个，不是供应商的 key
+  auth_token: "sk-proxy-自定义一个"   # chatbox 里填这个，不是供应商的 key
 ```
 
 > 密钥可以走环境变量，优先级高于明文：
@@ -65,12 +65,15 @@ server:
 chmod +x ctl.sh && ./ctl.sh start     # 本地调试用；长期运行请用下面的 systemd
 ```
 
-在 Open WebUI 里：设置 → 外部连接（OpenAI API）
+在 chatbox 里按 OpenAI 兼容接口接入：
 
 | 字段 | 值 |
 |---|---|
-| API Base URL | `http://<服务器IP>:8787/run/v1` |
-| API Key | `server.auth_token` |
+| API Base URL | `http://<服务器IP>:8787/<provider>/v1` |
+| API Key | `server.auth_token`（**不是供应商的 key**） |
+
+`<provider>` 换成 `config.yaml` 里配的任意 `name`。每个供应商一个独立 URL，
+保存后 chatbox 会自动从 `/<provider>/v1/models` 拉到模型列表。
 
 ---
 

@@ -4,22 +4,25 @@
 # 除 tokenizer.encoding 外，本文件所有字段都支持热重载（./ctl.sh reload）
 # ============================================================
 
-# ===== 上游模型供应商（可配多个，每个自动生成 /<name>/v1 端点）=====
+# ===== 上游模型供应商（可配多个，每个自动生成 /<provider>/v1 端点）=====
+# name 就是 URL 里的 <provider>，自己起，只能用字母数字下划线连字符。
 # api_key 优先读环境变量 UPSTREAM_API_KEY__<NAME大写>（name 中的 - 换成 _）
 providers:
-  - name: run
+  # 多模态供应商示例：把 name 换成你自己的标识
+  - name: provider-a
     base_url: ""
     api_key: ""
     timeout_seconds: 300
     connect_timeout_seconds: 30
     multimodal: true                           # false = 转发前剥掉历史里的图片，只留 [图片] 占位
 
-  - name: ds
+  # 纯文本供应商示例：不支持图片的模型必须设 multimodal: false，否则带图历史会报错
+  - name: provider-b
     base_url: ""
     api_key: ""
     timeout_seconds: 300
     connect_timeout_seconds: 30
-    multimodal: false                          # DeepSeek 等纯文本模型必须设 false，否则带图历史会报错
+    multimodal: false
 
 # ===== 上下文压缩 =====
 summary:

@@ -26,7 +26,7 @@
 
 ### 401 unauthorized
 
-Open WebUI 里的 API Key 要填 `server.auth_token`，**不是供应商的 key**。
+chatbox 里的 API Key 要填 `server.auth_token`，**不是供应商的 key**。
 `./ctl.sh reload` 报 401 说明脚本没从 `config.yaml` 解析到 token，它会自动回退 SIGHUP，配置仍然生效。
 
 ### 404 unknown provider
