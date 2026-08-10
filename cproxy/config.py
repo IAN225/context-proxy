@@ -1,0 +1,215 @@
+"""配置加载与热重载。
+
+除 ``tokenizer.encoding`` 外的所有字段都在读取时才从 ``CONFIG`` 取值，
+因此 ``/admin/reload`` 或 SIGHUP 后立即生效（含 ``per_message_overhead``）。
+"""
+
+from __future__ import annotations
+
+import copy
+import os
+import re
+import threading
+from typing import Any
+
+import yaml
+
+CONFIG_PATH = os.environ.get("PROXY_CONFIG", "config.yaml")
+
+_LOCK = threading.RLock()
+_CONFIG: dict[str, Any] = {}
+_PROVIDERS: dict[str, dict[str, Any]] = {}
+_SECRETS: dict[str, str | None] = {}
+
+DEFAULTS: dict[str, Any] = {
+    "summary": {
+        "enabled": True,
+        "trigger_tokens": 39200,
+        "keep_recent_tokens": 19200,
+        "summary_total_cap_tokens": 12800,
+        "summary_max_tokens": 2400,
+        "summary_batch_tokens": 10000,
+        "max_batches_per_request": 4,
+        "exit_gate_ratio": 1.2,
+        "checkpoint_keep": 10,
+        "summary_role": "system",
+        "persist_db": "logs/sessions.db",
+        "cache_max_entries": 1024,
+        "timeout_seconds": 180,
+        "main_max_attempts": 2,
+        "min_output_tokens": 50,
+    },
+    "stream": {"smooth_chars": 24, "smooth_delay": 0.008, "flush_backlog_chars": 600},
+    "tokenizer": {"encoding": "cl100k_base", "per_message_overhead": 12, "image_tokens": 1100},
+    "server": {"host": "0.0.0.0", "port": 8787},
+    "logging": {"level": "INFO", "file": "logs/proxy.log",
+                "max_bytes": 20 * 1024 * 1024, "backup_count": 5},
+}
+
+FALLBACK_PROMPTS: dict[str, str] = {
+    "batch_system": "你是一个对话历史压缩器，请把给到的对话片段压缩成不丢关键信息的结构化要点，禁止编造。",
+    "recompress_chunk": "下面是一份长摘要的一个片段，请只做压缩去冗余，严禁输出任何章节标题。",
+    "recompress_merge": "请把下列摘要材料合并去重，输出唯一一套章节结构的最终摘要，禁止重复章节。",
+    "injection": "以下是本次对话更早部分的摘要，请当作你自己的记忆继续对话：\n\n{summary}",
+    "fallback_notice": "\n\n【重要】用户可能从较早的消息处创建了分支，摘要与后续原文衔接处可能重叠或跳跃，冲突以原文为准。",
+}
+
+
+class ConfigError(RuntimeError):
+    pass
+
+
+def _resolve_secret(env_name: str, cfg_value: Any) -> str | None:
+    return os.environ.get(env_name) or (str(cfg_value).strip() if cfg_value else None) or None
+
+
+def provider_env_name(name: str) -> str:
+    return f"UPSTREAM_API_KEY__{re.sub(r'[^A-Za-z0-9]', '_', name).upper()}"
+
+
+def _merge_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
+    out = copy.deepcopy(cfg) if cfg else {}
+    for section, defaults in DEFAULTS.items():
+        node = out.setdefault(section, {}) or {}
+        if not isinstance(node, dict):
+            raise ConfigError(f"config.yaml 的 {section} 必须是一个映射")
+        for k, v in defaults.items():
+            node.setdefault(k, v)
+        out[section] = node
+    prompts = out["summary"].setdefault("prompts", {}) or {}
+    for k, v in FALLBACK_PROMPTS.items():
+        prompts.setdefault(k, v)
+    out["summary"]["prompts"] = prompts
+    fb = out["summary"].get("fallback")
+    if not isinstance(fb, dict):
+        fb = {}
+    fb.setdefault("enabled", False)
+    fb.setdefault("max_attempts", 3)
+    out["summary"]["fallback"] = fb
+    return out
+
+
+def _load_providers(cfg: dict[str, Any], warn) -> dict[str, dict[str, Any]]:
+    raw = cfg.get("providers") or []
+    if not raw:
+        raise ConfigError("config.yaml 缺少 providers 列表，至少配置一个供应商")
+    providers: dict[str, dict[str, Any]] = {}
+    for p in raw:
+        name = (p.get("name") or "").strip()
+        if not name or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise ConfigError(f"非法的 provider name: {name!r}")
+        if name in providers:
+            raise ConfigError(f"重复的 provider name: {name!r}")
+        base_url = (p.get("base_url") or "").strip().rstrip("/")
+        if not base_url:
+            raise ConfigError(f"provider {name!r} 缺少 base_url")
+        key = _resolve_secret(provider_env_name(name), p.get("api_key"))
+        if not key:
+            warn("provider %r 未配置 api_key", name)
+        providers[name] = {
+            "name": name,
+            "base_url": base_url,
+            "api_key": key,
+            "timeout_seconds": p.get("timeout_seconds", 300),
+            "connect_timeout_seconds": p.get("connect_timeout_seconds", 30),
+            "multimodal": bool(p.get("multimodal", True)),
+        }
+    return providers
+
+
+def reload(warn=lambda *a, **k: None) -> dict[str, Any]:
+    """重新读取 config.yaml。校验失败时抛异常，调用方负责保留旧配置。"""
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f) or {}
+    cfg = _merge_defaults(raw)
+    providers = _load_providers(cfg, warn)
+    secrets = {
+        "summary": _resolve_secret("SUMMARY_API_KEY", cfg["summary"].get("api_key")),
+        "summary_fallback": _resolve_secret("SUMMARY_FALLBACK_API_KEY",
+                                            cfg["summary"]["fallback"].get("api_key")),
+        "auth": _resolve_secret("PROXY_AUTH_TOKEN", cfg["server"].get("auth_token")),
+    }
+    with _LOCK:
+        global _CONFIG, _PROVIDERS, _SECRETS
+        _CONFIG, _PROVIDERS, _SECRETS = cfg, providers, secrets
+    return {
+        "providers": list(providers),
+        "summary_model": cfg["summary"].get("model"),
+        "summary_fallback_model": cfg["summary"]["fallback"].get("model")
+        if cfg["summary"]["fallback"].get("enabled") else None,
+        "auth_enabled": bool(secrets["auth"]),
+    }
+
+
+# ===== 读取接口（全部实时取值，保证热重载生效）=====
+def cfg() -> dict[str, Any]:
+    return _CONFIG
+
+
+def summary() -> dict[str, Any]:
+    return _CONFIG["summary"]
+
+
+def prompts() -> dict[str, str]:
+    return _CONFIG["summary"]["prompts"]
+
+
+def stream_cfg() -> dict[str, Any]:
+    return _CONFIG["stream"]
+
+
+def tokenizer_cfg() -> dict[str, Any]:
+    return _CONFIG["tokenizer"]
+
+
+def providers() -> dict[str, dict[str, Any]]:
+    return _PROVIDERS
+
+
+def provider(name: str) -> dict[str, Any] | None:
+    return _PROVIDERS.get(name)
+
+
+def auth_token() -> str | None:
+    return _SECRETS.get("auth")
+
+
+def summary_endpoints() -> list[dict[str, Any]]:
+    """返回摘要模型调用链：[主, 备]。缺配置的条目会被过滤掉。"""
+    s = summary()
+    out: list[dict[str, Any]] = []
+    if s.get("base_url") and _SECRETS.get("summary") and s.get("model"):
+        out.append({
+            "tag": "primary",
+            "base_url": str(s["base_url"]).rstrip("/"),
+            "api_key": _SECRETS["summary"],
+            "model": s["model"],
+            "max_attempts": max(1, int(s.get("main_max_attempts", 2))),
+        })
+    fb = s.get("fallback") or {}
+    if fb.get("enabled") and fb.get("base_url") and _SECRETS.get("summary_fallback") and fb.get("model"):
+        out.append({
+            "tag": "fallback",
+            "base_url": str(fb["base_url"]).rstrip("/"),
+            "api_key": _SECRETS["summary_fallback"],
+            "model": fb["model"],
+            "max_attempts": max(1, int(fb.get("max_attempts", 3))),
+        })
+    return out
+
+
+def db_path() -> str | None:
+    path = summary().get("persist_db")
+    if not path:
+        return None
+    if not os.path.isabs(path):
+        base = os.path.dirname(os.path.abspath(CONFIG_PATH)) or "."
+        path = os.path.join(base, path)
+    return path
+
+
+def resolve_path(path: str) -> str:
+    if os.path.isabs(path):
+        return path
+    base = os.path.dirname(os.path.abspath(CONFIG_PATH)) or "."
+    return os.path.join(base, path)

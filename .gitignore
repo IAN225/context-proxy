@@ -1,0 +1,8 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+logs/
+proxy.pid
+config.local.yaml
+config.smoke.yaml

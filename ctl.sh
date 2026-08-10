@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# 前台/后台管理脚本。长期运行推荐用 systemd（见 readme），这里主要用于本地调试。
+set -euo pipefail
+cd "$(dirname "$0")"
+
+PIDFILE="proxy.pid"
+STDERR_LOG="logs/stderr.log"      # 只兜住进程级崩溃输出；正常日志由 proxy 自己轮转写 logs/proxy.log
+LOG="logs/proxy.log"
+PORT="${PROXY_PORT:-8787}"
+
+TOKEN="${PROXY_AUTH_TOKEN:-}"
+if [ -z "$TOKEN" ] && [ -f config.yaml ]; then
+  TOKEN=$(grep -E '^\s*auth_token:' config.yaml | head -1 | sed -E 's/.*auth_token:\s*"?([^"#]*)"?.*/\1/' | xargs || true)
+fi
+
+if [ -x "venv/bin/python" ] && venv/bin/python -c "import httpx" 2>/dev/null; then
+  PY="venv/bin/python"
+else
+  PY="python3"
+fi
+
+_pid() {
+  pgrep -f "proxy.py" 2>/dev/null | while read -r p; do
+    c=$(tr '\0' ' ' </proc/"$p"/cmdline 2>/dev/null || true)
+    case "$c" in
+      *python*\ proxy.py*|*python*/proxy.py*) echo "$p";;
+    esac
+  done | head -1
+}
+
+_api() { # _api METHOD PATH [DATA]
+  local m="$1" p="$2" d="${3:-}"
+  if [ -n "$d" ]; then
+    curl -s -X "$m" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+      -d "$d" "http://127.0.0.1:$PORT$p"
+  else
+    curl -s -X "$m" -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT$p"
+  fi | python3 -m json.tool 2>/dev/null || echo "(请求失败或服务未运行)"
+}
+
+case "${1:-status}" in
+  start)
+    if [ -n "$(_pid)" ]; then echo "已在运行 PID=$(_pid)"; exit 0; fi
+    mkdir -p logs
+    # >> 而不是 >：每次重启都保留上一次的崩溃现场
+    setsid nohup "$PY" proxy.py >> "$STDERR_LOG" 2>&1 < /dev/null &
+    sleep 3
+    p=$(_pid)
+    if [ -z "$p" ]; then
+      echo "启动失败，最后 20 行 $STDERR_LOG："
+      tail -20 "$STDERR_LOG" 2>/dev/null
+      exit 1
+    fi
+    echo "$p" > "$PIDFILE"
+    echo "已启动 PID=$p"
+    _api GET /health
+    ;;
+  stop)
+    p=$(_pid)
+    if [ -n "$p" ]; then kill "$p"; echo "已停止 PID=$p"; else echo "未在运行"; fi
+    rm -f "$PIDFILE"
+    ;;
+  restart) "$0" stop || true; sleep 1; "$0" start ;;
+  reload)
+    if curl -fsS -X POST -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/admin/reload" >/dev/null; then
+      echo "已热重载"; _api GET /health
+    else
+      p=$(_pid)
+      if [ -n "$p" ]; then kill -HUP "$p"; echo "已发 SIGHUP 重载 PID=$p"; else echo "未在运行"; fi
+    fi
+    ;;
+  status)
+    p=$(_pid)
+    if [ -n "$p" ]; then echo "运行中 PID=$p"; _api GET /health; else echo "未运行"; fi
+    ;;
+  sessions) _api GET /admin/sessions ;;
+  session)
+    [ -z "${2:-}" ] && { echo "用法: $0 session <conv_id 前几位>"; exit 1; }
+    _api GET "/admin/session/$2"
+    ;;
+  clean)
+    [ -z "${2:-}" ] && { echo "用法: $0 clean all | $0 clean <conv_id 前几位>"; exit 1; }
+    if [ "$2" = "all" ]; then
+      printf '确认清空【全部】会话？这会让所有对话下次触发全量重压 [y/N] '
+      read -r ans
+      case "$ans" in y|Y) ;; *) echo "已取消"; exit 0;; esac
+    fi
+    _api POST /admin/clean "{\"target\":\"$2\"}"
+    ;;
+  log) tail -f "$LOG" ;;
+  errlog) tail -f "$STDERR_LOG" ;;
+  *)
+    echo "用法: $0 {start|stop|restart|reload|status|log|errlog|sessions|session <id>|clean all|clean <id>}"
+    exit 1
+    ;;
+esac
