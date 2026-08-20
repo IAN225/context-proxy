@@ -104,6 +104,10 @@ async def health():
         "uptime_seconds": int(time.time() - STARTED_AT),
         "providers": {n: {"multimodal": p["multimodal"]} for n, p in config.providers().items()},
         "summary_model": config.summary().get("model"),
+        "trigger_tokens": config.summary().get("trigger_tokens"),
+        # 有效值：配置值与 trigger 的 50% 取小，两者不一致说明 config 写大了
+        "keep_recent_tokens_effective": config.keep_recent_tokens(),
+        "keep_recent_tokens_configured": config.summary().get("keep_recent_tokens"),
         "summary_fallback": ((config.summary().get("fallback") or {}).get("model")
                              if (config.summary().get("fallback") or {}).get("enabled") else None),
         "persist_db": st.path or "disabled",

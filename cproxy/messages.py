@@ -173,6 +173,17 @@ def msg_tokens(m: dict) -> int:
     return total
 
 
+def tool_tokens(m: dict) -> int:
+    """这条消息里由工具调用产生的 token：tool 消息整条算，assistant 只算 tool_calls 部分。
+
+    只用于报错时的归因诊断，不参与任何阈值计算。
+    """
+    if m.get("role") == "tool":
+        return msg_tokens(m)
+    tc = _tool_calls_text(m)
+    return text_tokens(tc) if tc else 0
+
+
 def count_tokens(messages: Iterable[dict]) -> int:
     return sum(msg_tokens(m) for m in messages)
 

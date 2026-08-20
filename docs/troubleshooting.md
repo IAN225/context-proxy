@@ -63,6 +63,32 @@ URL 里的 `<name>` 和 `config.yaml` 的 `providers[].name` 对不上。Base UR
 
 配一个 `summary.fallback` 备用模型能显著降低整条链路的失败率。
 
+### 日志出现「近期原文只剩 N tokens，原文窗口回退」
+
+不是故障，是下限保护在生效：这个会话存量的压缩位置留不够 `keep_recent_tokens` 了，
+代理把原文窗口往回退补足，被回退的那几轮会同时出现在摘要和原文里（冲突以原文为准）。
+日志会点明触发原因——用户删了近期消息 / 调大了 `keep_recent_tokens` / 旧库迁移的切点。
+
+下一次真正触发压缩后切点重算，重叠自动消失。如果**每一次请求都在回退**且从不消失，
+检查 `keep_recent_tokens` 是不是被调到和 `trigger_tokens` 一样大了——
+那样永远攒不出可压的新内容，会一直卡在重叠状态。
+
+### 启动日志出现「keep_recent_tokens 超过 trigger_tokens 的 50%，实际按 N 生效」
+
+近期原文下限有效值自动封顶在 `trigger_tokens` 的一半，配置写得再大也按封顶值生效。
+这是防止"硬下限"和出口闸门互相打架。`/health` 里
+`keep_recent_tokens_configured` 与 `keep_recent_tokens_effective` 不一致就是这种情况，
+想真正留更多近期原文请调高 `trigger_tokens`。
+
+### 503 里写着「压缩已经压无可压」/ `cause: oversize_tail`
+
+近期原文已经封顶了还顶穿闸门，说明**最后一轮原文自己就太大**。错误信息里会报出
+最后一轮的 token 数，以及其中多少来自工具调用与工具返回。
+
+工具调用的请求参数和返回结果会整段留在近期原文里，压缩碰不到它们，
+是这条路径最常见的成因。按提示编辑或缩短最后一条消息后重发，
+并避免在这一轮让模型调用工具；反复出现则说明 `trigger_tokens` 对这个对话设得太小。
+
 ### 兜底频繁触发
 
 `/health` 的 `fallback_activations` 每涨一次，日志里都有一条：

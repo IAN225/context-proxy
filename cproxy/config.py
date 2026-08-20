@@ -55,6 +55,13 @@ FALLBACK_PROMPTS: dict[str, str] = {
 }
 
 
+# 近期原文下限的硬上限：不得超过 trigger_tokens 的这个比例。
+# 下限是"保不住就报错"的硬指标，它一旦逼近触发阈值就会和出口闸门打架——
+# 压完一次剩不下多少余量，很快又触发，叠上摘要就顶穿闸门。
+# 所以配置里写多大都没用，实际生效值在这里封顶。
+KEEP_RECENT_MAX_RATIO = 0.5
+
+
 class ConfigError(RuntimeError):
     pass
 
@@ -123,6 +130,12 @@ def reload(warn=lambda *a, **k: None) -> dict[str, Any]:
         raw = yaml.safe_load(f) or {}
     cfg = _merge_defaults(raw)
     providers = _load_providers(cfg, warn)
+    trig, want = int(cfg["summary"]["trigger_tokens"]), int(cfg["summary"]["keep_recent_tokens"])
+    hard = int(trig * KEEP_RECENT_MAX_RATIO)
+    if want > hard:
+        warn("keep_recent_tokens=%d 超过 trigger_tokens(%d) 的 %d%%，实际按 %d 生效"
+             "（近期原文是硬性下限，留太多会和出口闸门打架）",
+             want, trig, int(KEEP_RECENT_MAX_RATIO * 100), hard)
     secrets = {
         "summary": _resolve_secret("SUMMARY_API_KEY", cfg["summary"].get("api_key")),
         "summary_fallback": _resolve_secret("SUMMARY_FALLBACK_API_KEY",
@@ -148,6 +161,16 @@ def cfg() -> dict[str, Any]:
 
 def summary() -> dict[str, Any]:
     return _CONFIG["summary"]
+
+
+def keep_recent_tokens() -> int:
+    """近期原文下限的**有效值**：配置值与 trigger×KEEP_RECENT_MAX_RATIO 取小。
+
+    别处一律用这个函数，不要直接读 summary()["keep_recent_tokens"]。
+    """
+    s = summary()
+    return min(int(s["keep_recent_tokens"]),
+               int(int(s["trigger_tokens"]) * KEEP_RECENT_MAX_RATIO))
 
 
 def prompts() -> dict[str, str]:

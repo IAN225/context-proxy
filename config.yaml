@@ -30,7 +30,13 @@ summary:
 
   # --- 阈值 ---
   trigger_tokens: 39200                        # 等效总量超过此值触发压缩
-  keep_recent_tokens: 19200                    # 压缩时保留的"近期原文"下限（按轮对齐，只多不少）
+  keep_recent_tokens: 19200                    # 近期原文的**硬性下限**（按轮对齐，只多不少）。
+                                               # 只要会话压缩过，之后任何路径转发给上游的逐字原文
+                                               # 都不会低于这个值（除非整个对话本身就没这么长）；
+                                               # 存量切点不满足时会把原文窗口往回退，宁可与摘要重叠。
+                                               # 【自动封顶】有效值不超过 trigger_tokens 的 50%，
+                                               # 写得再大也按 0.5×trigger 生效（写小于则按写的来）。
+                                               # 实际生效值见 /health 的 keep_recent_tokens_effective。
   summary_total_cap_tokens: 12800              # 累积摘要超过此值触发二次重压
   summary_max_tokens: 2400                     # 单次摘要调用的输出上限
   summary_batch_tokens: 10000                  # 单批送入摘要模型的输入上限

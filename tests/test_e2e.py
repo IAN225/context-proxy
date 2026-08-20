@@ -577,3 +577,204 @@ def test_legacy_sessions_table_is_migrated():
     assert r.status_code == 200, r.text
     s = sessions()[0]
     assert s["compressed_upto"] >= upto, "迁移过来的会话不该从 0 重压"
+
+
+# ---- 近期原文硬下限：压缩过的会话，任何路径都不能让原文低于 keep_recent_tokens ----
+
+def test_recent_verbatim_floor_survives_user_deleting_recent_messages():
+    """用户删掉近期若干轮后，compressed_upto 逼近末尾，原文窗口必须回退。"""
+    fresh()
+    history = convo(30)
+    assert post("mm", history).status_code == 200
+    upto = sessions()[0]["compressed_upto"]
+    assert upto > 0
+
+    # 砍掉压缩位置之后的绝大部分原文，只留 1 条
+    truncated = history[:1] + history[1:][:upto + 1]
+    r = post("mm", truncated)
+    assert r.status_code == 200, r.text
+    call = chat_calls()[-1]
+    # 摘要仍在，但原文窗口回退了：转发条数明显多于 "只剩 1 条"
+    assert call["roles"][1] == "system"
+    assert call["n_messages"] > 4, call["roles"]
+    # 已压缩位置本身没有被改写（只是展示窗口回退）
+    assert sessions()[0]["compressed_upto"] == upto
+
+
+def test_recent_verbatim_floor_survives_raising_keep_recent():
+    """运行中调大 keep_recent_tokens，存量 checkpoint 的切点按旧值定，必须回退补足。"""
+    fresh(keep_recent_tokens=300)
+    history = convo(30)
+    assert post("mm", history).status_code == 200
+    before = chat_calls()[-1]["n_messages"]
+    upto = sessions()[0]["compressed_upto"]
+
+    # 只调大下限，不动 DB
+    write_config(f"db/t{_counter['n']}.db", keep_recent_tokens=900)
+    app_module.do_reload()
+
+    r = post("mm", history)
+    assert r.status_code == 200, r.text
+    after = chat_calls()[-1]["n_messages"]
+    assert after > before, f"下限调大后原文应当变多: {before} -> {after}"
+    assert sessions()[0]["compressed_upto"] == upto, "只回退展示窗口，不改写已压缩位置"
+
+
+def test_recent_verbatim_floor_after_legacy_migration():
+    """旧库迁移来的 compressed_upto 出自另一套阈值，同样受下限保护。"""
+    _counter["n"] += 1
+    db_rel = f"db/floor{_counter['n']}.db"
+    db_abs = TMP / db_rel
+    db_abs.parent.mkdir(parents=True, exist_ok=True)
+
+    history = convo(30)
+    body = [m for m in history if m.get("role") != "system"]
+    from cproxy import messages as M
+    upto = len(body) - 2          # 旧库把原文几乎全压掉了，只剩一轮
+    conn = sqlite3.connect(db_abs)
+    conn.execute("CREATE TABLE sessions (conv_id TEXT PRIMARY KEY, summary TEXT, "
+                 "compressed_upto INTEGER, boundary_fp TEXT, ts REAL)")
+    conn.execute("INSERT INTO sessions VALUES (?,?,?,?,?)",
+                 (M.legacy_conv_id(body), "## 关键事实\n旧库摘要。", upto,
+                  M.legacy_boundary_fp(body[upto - 1]), time.time()))
+    conn.commit()
+    conn.close()
+
+    write_config(db_rel, keep_recent_tokens=1200)
+    app_module.do_reload()
+    httpx.post(f"{MOCK}/__reset", timeout=5)
+
+    r = post("mm", history)
+    assert r.status_code == 200, r.text
+    call = chat_calls()[-1]
+    assert call["n_messages"] > 4, f"迁移来的切点只剩 2 条原文，必须回退补足: {call['roles']}"
+
+
+def test_floor_never_pushes_window_forward_in_steady_state():
+    """稳态下不该有任何回退：原文窗口就等于已压缩位置，不产生重叠。"""
+    fresh()
+    history = convo(30)
+    assert post("mm", history).status_code == 200
+    upto = sessions()[0]["compressed_upto"]
+    n_after_compress = chat_calls()[-1]["n_messages"]
+
+    for k in range(3):
+        history = history + convo(1, start=700 + k, head=False)
+        assert post("mm", history).status_code == 200
+    call = chat_calls()[-1]
+    # 头部 system + 摘要 + (len(body) - upto) 条原文，一条不多一条不少
+    body_len = len([m for m in history if m.get("role") != "system"])
+    assert call["n_messages"] == 2 + (body_len - upto), call["roles"]
+    assert call["n_messages"] == n_after_compress + 6
+
+
+def test_keep_recent_is_capped_at_half_of_trigger():
+    """配置写多大都没用：近期原文下限的有效值封顶在 trigger 的 50%。"""
+    fresh(trigger_tokens=1200, keep_recent_tokens=5000)
+    h = httpx.get(f"{PROXY}/health", timeout=5).json()
+    assert h["keep_recent_tokens_configured"] == 5000
+    assert h["keep_recent_tokens_effective"] == 600
+
+    # 封顶之后下限不再和出口闸门打架，请求正常通过
+    r = post("mm", convo(30))
+    assert r.status_code == 200, r.text
+    assert chat_calls()[-1]["n_messages"] < 60
+
+    # 配置值小于一半时按配置来，不动它
+    fresh(trigger_tokens=1200, keep_recent_tokens=300)
+    h = httpx.get(f"{PROXY}/health", timeout=5).json()
+    assert h["keep_recent_tokens_effective"] == 300
+
+
+def test_tool_call_bloat_is_refused_with_actionable_message():
+    """下限封顶后还顶穿闸门，只可能是最后一轮自己太大（最常见是工具调用）。
+    这时直接报错，并明确告诉用户改消息、别让模型调工具。"""
+    fresh(trigger_tokens=1200, keep_recent_tokens=400)
+    history = convo(20)
+    history += [
+        {"role": "user", "content": "帮我查一下" + FILLER},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "search",
+                                      "arguments": '{"q":"' + FILLER * 30 + '"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "工具返回：" + FILLER * 30},
+    ]
+    r = post("mm", history)
+    assert r.status_code == 503, r.text
+    d = r.json()["error"]["detail"]
+    assert d["cause"] == "oversize_tail"
+    assert d["tool_tokens"] > 0, "要能归因到工具调用占了多少"
+    assert d["last_round_tokens"] > d["gate_tokens"] - d["keep_recent_floor"]
+    msg = r.json()["error"]["message"]
+    assert "工具调用" in msg and "编辑或缩短最后一条消息" in msg
+    assert "避免在这一轮里让模型调用工具" in msg
+    assert not chat_calls(), "绝不能把超标请求转发给上游"
+
+
+def _legacy_state(db_rel, history, upto, **cfg):
+    """造一个"已压缩到 upto、近期原文只剩几条"的存量会话（走旧库迁移那条路）。"""
+    from cproxy import messages as M
+    db_abs = TMP / db_rel
+    db_abs.parent.mkdir(parents=True, exist_ok=True)
+    body = [m for m in history if m.get("role") != "system"]
+    conn = sqlite3.connect(db_abs)
+    conn.execute("CREATE TABLE sessions (conv_id TEXT PRIMARY KEY, summary TEXT, "
+                 "compressed_upto INTEGER, boundary_fp TEXT, ts REAL)")
+    conn.execute("INSERT INTO sessions VALUES (?,?,?,?,?)",
+                 (M.legacy_conv_id(body), "## 关键事实与专有名词\n旧库留下的累积摘要。", upto,
+                  M.legacy_boundary_fp(body[upto - 1]), time.time()))
+    conn.commit()
+    conn.close()
+    write_config(db_rel, **cfg)
+    app_module.do_reload()
+    httpx.post(f"{MOCK}/__reset", timeout=5)
+
+
+def test_stuck_window_recovers_without_edit_and_survives_editing_last_message():
+    """复现"近期原文只剩 3 条"的存量状态，验证三件事：
+    1. 不需要用户做任何事，下一次请求窗口就自己回退补足；
+    2. 编辑最后一条消息不会打乱定位，也不会触发全量重压或兜底；
+    3. 对话继续增长后压缩正常推进，重叠自动消失（窗口不会永远停在回退状态）。
+    """
+    _counter["n"] += 1
+    history = convo(40)
+    body_len = len([m for m in history if m.get("role") != "system"])
+    upto = body_len - 3                      # 只剩 3 条原文
+    _legacy_state(f"db/stuck{_counter['n']}.db", history, upto,
+                  trigger_tokens=1200, keep_recent_tokens=400)
+
+    # 1) 什么都不改，直接发一次
+    r = post("mm", history)
+    assert r.status_code == 200, r.text
+    first = chat_calls()[-1]
+    assert first["n_messages"] > 3 + 2, f"窗口应当自动回退补足，实际只发了 {first['n_messages']} 条"
+    assert httpx.get(f"{PROXY}/health", timeout=5).json()["fallback_activations"] == 0
+    assert sessions()[0]["compressed_upto"] == upto, "只回退展示窗口，不改写已压缩位置"
+    n_summary = len(summary_calls())
+
+    # 迁移来的 checkpoint 已经补上指纹数组，从此能检测分叉
+    detail = session_detail(sessions()[0]["conv_id"])
+    assert detail["checkpoints"][0]["signature_len"] == body_len
+
+    # 2) 编辑最后一条消息后重发
+    edited = list(history)
+    edited[-1] = {"role": "assistant", "content": "【改写后的最后一条回答】" + FILLER * 2}
+    r = post("mm", edited)
+    assert r.status_code == 200, r.text
+    assert len(summary_calls()) == n_summary, "改最后一条不该触发重压"
+    assert httpx.get(f"{PROXY}/health", timeout=5).json()["fallback_activations"] == 0
+    assert sessions()[0]["compressed_upto"] == upto
+    assert chat_calls()[-1]["n_messages"] == first["n_messages"], "窗口位置保持一致"
+
+    # 3) 继续聊，直到攒够新内容触发压缩：压缩位置推进，重叠消失
+    grown = edited
+    for k in range(40):
+        grown = grown + convo(1, start=900 + k, head=False)
+        assert post("mm", grown).status_code == 200
+        if sessions()[0]["compressed_upto"] > upto:
+            break
+    s = sessions()[0]
+    assert s["compressed_upto"] > upto, "对话增长后压缩应当正常推进"
+    grown_body = len([m for m in grown if m.get("role") != "system"])
+    assert chat_calls()[-1]["n_messages"] == 2 + (grown_body - s["compressed_upto"]), \
+        "推进之后窗口就等于已压缩位置，不再重叠"
