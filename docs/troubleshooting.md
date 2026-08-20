@@ -73,9 +73,21 @@ URL 里的 `<name>` 和 `config.yaml` 的 `providers[].name` 对不上。Base UR
 检查 `keep_recent_tokens` 是不是被调到和 `trigger_tokens` 一样大了——
 那样永远攒不出可压的新内容，会一直卡在重叠状态。
 
-如果 503 的错误信息里出现「keep_recent_tokens 与 trigger_tokens 配置冲突」，
-说明保住下限就必然超出出口闸门。代理的取舍是**下限优先、宁可报错**，
-不会偷偷少发原文。按提示调低 `keep_recent_tokens` 或调高 `trigger_tokens` 即可。
+### 启动日志出现「keep_recent_tokens 超过 trigger_tokens 的 50%，实际按 N 生效」
+
+近期原文下限有效值自动封顶在 `trigger_tokens` 的一半，配置写得再大也按封顶值生效。
+这是防止"硬下限"和出口闸门互相打架。`/health` 里
+`keep_recent_tokens_configured` 与 `keep_recent_tokens_effective` 不一致就是这种情况，
+想真正留更多近期原文请调高 `trigger_tokens`。
+
+### 503 里写着「压缩已经压无可压」/ `cause: oversize_tail`
+
+近期原文已经封顶了还顶穿闸门，说明**最后一轮原文自己就太大**。错误信息里会报出
+最后一轮的 token 数，以及其中多少来自工具调用与工具返回。
+
+工具调用的请求参数和返回结果会整段留在近期原文里，压缩碰不到它们，
+是这条路径最常见的成因。按提示编辑或缩短最后一条消息后重发，
+并避免在这一轮让模型调用工具；反复出现则说明 `trigger_tokens` 对这个对话设得太小。
 
 ### 兜底频繁触发
 

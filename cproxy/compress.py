@@ -56,13 +56,20 @@ class CompressionRefused(Exception):
             if d.get("keep_recent_floor") and d.get("retained_tokens"):
                 lines.append(
                     f"其中近期原文 {d['retained_tokens']} tokens 是硬性保留的"
-                    f"（keep_recent_tokens={d['keep_recent_floor']}），压缩不会动它。"
-                    "若长期卡在这里，说明 keep_recent_tokens 与 trigger_tokens 配置冲突，"
-                    "请调低前者或调高后者。")
-        planned, done = d.get("batches_planned"), d.get("batches_done")
-        if planned and done is not None and done < planned:
-            lines.append(f"本次请求压了 {done}/{planned} 批就到达单请求上限（避免一个请求跑几十分钟）。"
-                         "超大历史的首次压缩需要分几次请求完成，重发几次即可。")
+                    f"（keep_recent_tokens 有效值 {d['keep_recent_floor']}，"
+                    "已按 trigger_tokens 的 50% 自动封顶），压缩不会动它。")
+        if d.get("cause") == "batch_cap":
+            lines.append(f"本次请求压了 {d.get('batches_done')}/{d.get('batches_planned')} 批就到达"
+                         "单请求上限（避免一个请求跑几十分钟）。超大历史的首次压缩需要分几次请求完成。")
+        elif d.get("cause") == "oversize_tail":
+            # 近期原文已经按 trigger 的 50% 封顶了，还顶穿闸门只可能是这一段本身太大
+            lines.append(f"压缩已经压无可压：最近一轮原文本身就有 {d.get('last_round_tokens', '?')} tokens，"
+                         "它属于硬性保留的近期原文，压缩碰不到它。")
+            if d.get("tool_tokens"):
+                lines.append(f"其中 {d['tool_tokens']} tokens 来自工具调用与工具返回——"
+                             "工具调用的请求与结果会整段留在近期原文里，是最常见的撑爆原因。")
+            lines.append("请这样处理：编辑或缩短最后一条消息后重发，并避免在这一轮里让模型调用工具；"
+                         "如果反复出现，说明 trigger_tokens 相对这个对话设得太小了。")
         lines.append("已完成的部分**已经保存**，直接重发这条消息即可从断点继续，不会重复计费。")
         return "\n".join(lines)
 
@@ -262,7 +269,7 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
     already = max(0, min(located.already, len(body)))
     prev_summary = located.summary or ""
     is_fallback = located.mode == "fallback"
-    keep_recent = int(s["keep_recent_tokens"])
+    keep_recent = config.keep_recent_tokens()      # 已按 trigger 的 50% 封顶
     # 已压缩位置只决定"还要摘要什么"；实际发出去的原文从 retain_from 起，受硬下限保护
     retain_from = _floor_retain(rounds, infos, already, keep_recent, conv_id or "new")
 
@@ -483,7 +490,7 @@ async def _fallback_path(head, body, infos, rounds, cur_sig, key, conv_id, locat
     """
     st = store.get()
     s = config.summary()
-    keep_recent = int(s["keep_recent_tokens"])
+    keep_recent = config.keep_recent_tokens()
     total_rounds = len(rounds)
 
     pinned = await st.load_pinned(conv_id) if conv_id else None
@@ -546,12 +553,21 @@ def _finish(final: list[dict], provider: dict[str, Any], meta: dict[str, Any],
         if rounds is not None and infos is not None and keep_from is not None:
             remaining_rounds = max(0, M.rounds_before(rounds, keep_from) - int(meta.get("round_upto") or 0))
             remaining_tokens = M.tokens_of(infos, int(meta.get("compressed_upto") or 0), keep_from)
-        log.error("出口闸门拦截：待转发 %d tokens > 闸门 %d（trigger %d × %.2f），mode=%s",
-                  final_tokens, gate, trigger, ratio, meta.get("mode"))
+        planned, done = meta.get("batches_planned"), meta.get("batches_done")
+        cause = "batch_cap" if (planned and done is not None and done < planned) else "oversize_tail"
+        extra: dict[str, Any] = {"cause": cause}
+        if cause == "oversize_tail":
+            # 近期原文已经按 trigger 的 50% 封顶，还顶穿闸门就只剩两种可能：
+            # 最后一轮本身太大，或者这一轮里塞了工具调用。两个数都报出来，让用户能对症下药。
+            extra["tool_tokens"] = sum(M.tool_tokens(m) for m in final)
+            if rounds and infos:
+                extra["last_round_tokens"] = M.tokens_of(infos, rounds[-1][0], len(infos))
+        log.error("出口闸门拦截：待转发 %d tokens > 闸门 %d（trigger %d × %.2f），mode=%s，成因=%s%s",
+                  final_tokens, gate, trigger, ratio, meta.get("mode"), cause,
+                  f"，其中工具调用占 {extra['tool_tokens']} tokens" if extra.get("tool_tokens") else "")
         raise CompressionRefused(
-            "压缩后仍超出转发上限，为避免按全量 token 计费已拦截。"
-            "常见原因：最近一轮原文本身就超过阈值、或本次请求的批次上限没压完。",
-            {**meta, "total_rounds": total_rounds or meta.get("rounds"),
+            "压缩后仍超出转发上限，为避免按全量 token 计费已拦截。",
+            {**meta, **extra, "total_rounds": total_rounds or meta.get("rounds"),
              "remaining_rounds": remaining_rounds, "remaining_tokens": remaining_tokens,
              "progress_saved": True})
 

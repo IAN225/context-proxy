@@ -668,12 +668,44 @@ def test_floor_never_pushes_window_forward_in_steady_state():
     assert call["n_messages"] == n_after_compress + 6
 
 
-def test_floor_beats_gate_and_says_so():
-    """下限与出口闸门冲突时：宁可报错，也不偷偷少发原文，且报错要点明是配置打架。"""
-    fresh(trigger_tokens=1200, keep_recent_tokens=1500)
+def test_keep_recent_is_capped_at_half_of_trigger():
+    """配置写多大都没用：近期原文下限的有效值封顶在 trigger 的 50%。"""
+    fresh(trigger_tokens=1200, keep_recent_tokens=5000)
+    h = httpx.get(f"{PROXY}/health", timeout=5).json()
+    assert h["keep_recent_tokens_configured"] == 5000
+    assert h["keep_recent_tokens_effective"] == 600
+
+    # 封顶之后下限不再和出口闸门打架，请求正常通过
     r = post("mm", convo(30))
-    assert r.status_code == 503
-    msg = r.json()["error"]["message"]
-    assert "keep_recent_tokens" in msg and "配置冲突" in msg
+    assert r.status_code == 200, r.text
+    assert chat_calls()[-1]["n_messages"] < 60
+
+    # 配置值小于一半时按配置来，不动它
+    fresh(trigger_tokens=1200, keep_recent_tokens=300)
+    h = httpx.get(f"{PROXY}/health", timeout=5).json()
+    assert h["keep_recent_tokens_effective"] == 300
+
+
+def test_tool_call_bloat_is_refused_with_actionable_message():
+    """下限封顶后还顶穿闸门，只可能是最后一轮自己太大（最常见是工具调用）。
+    这时直接报错，并明确告诉用户改消息、别让模型调工具。"""
+    fresh(trigger_tokens=1200, keep_recent_tokens=400)
+    history = convo(20)
+    history += [
+        {"role": "user", "content": "帮我查一下" + FILLER},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "search",
+                                      "arguments": '{"q":"' + FILLER * 30 + '"}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "工具返回：" + FILLER * 30},
+    ]
+    r = post("mm", history)
+    assert r.status_code == 503, r.text
     d = r.json()["error"]["detail"]
-    assert d["retained_tokens"] >= d["keep_recent_floor"], "任何情况下都不能低于下限"
+    assert d["cause"] == "oversize_tail"
+    assert d["tool_tokens"] > 0, "要能归因到工具调用占了多少"
+    assert d["last_round_tokens"] > d["gate_tokens"] - d["keep_recent_floor"]
+    msg = r.json()["error"]["message"]
+    assert "工具调用" in msg and "编辑或缩短最后一条消息" in msg
+    assert "避免在这一轮里让模型调用工具" in msg
+    assert not chat_calls(), "绝不能把超标请求转发给上游"

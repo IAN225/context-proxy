@@ -213,9 +213,28 @@ COMMIT;
 回退会打 `WARNING` 并写明是哪种原因。阈值判断（是否触发压缩）也改用 `retain_from`
 之后的 token 量，保证"判断依据"和"实际发出去的内容"是同一个东西。
 
-**下限与出口闸门冲突时，下限优先、请求报错。** 即当保住下限就必然超过
-`trigger_tokens × exit_gate_ratio` 时，代理宁可 503 也不偷偷少发原文，
-错误信息里会点明是 `keep_recent_tokens` 与 `trigger_tokens` 配置打架。
+### 下限自身要封顶
+
+下限是"保不住就报错"的硬指标，那它就不能大到和触发阈值打架：`keep_recent` 一旦逼近
+`trigger`，压完一次剩不下多少余量，很快又触发，叠上摘要还会顶穿出口闸门。
+
+所以有效值在 `config.keep_recent_tokens()` 里**自动封顶为 `trigger_tokens × 50%`**
+（常量 `config.KEEP_RECENT_MAX_RATIO`）：配置写小于这个数就按配置来，写大了一律按
+`0.5 × trigger` 生效，并在加载配置时打一次 `WARNING`。代码里一律走这个函数，
+不要直接读 `summary()["keep_recent_tokens"]`。`/health` 同时暴露配置值和有效值。
+
+封顶之后，"下限 + 摘要"在正常配置下不可能顶穿 `1.2 × trigger`，
+出口闸门的拦截就只剩两种真实成因，`_finish()` 会分开归因：
+
+| `cause` | 含义 | 给用户的建议 |
+|---|---|---|
+| `batch_cap` | 本次请求到了 `max_batches_per_request` 上限，还没压完 | 重发几次即可，进度已落盘 |
+| `oversize_tail` | 压无可压——最后一轮原文自己就顶穿了闸门 | 编辑/缩短最后一条消息后重发，别在这一轮让模型调用工具 |
+
+`oversize_tail` 时错误信息里会报出最后一轮的 token 数，以及**其中有多少来自工具调用与
+工具返回**（`messages.tool_tokens()`，只用于归因，不参与任何阈值计算）。
+工具调用的请求与结果会整段留在近期原文里、压缩碰不到，是这条路径最常见的成因。
+
 `_finish()` 里另有一句告警型自检：还有原文可留却留少了就打 `ERROR`，抓漏网的 bug 路径。
 
 ---
