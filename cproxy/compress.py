@@ -53,6 +53,12 @@ class CompressionRefused(Exception):
                          f"剩余 {d.get('remaining_rounds', '?')} 轮 / 约 {d.get('remaining_tokens', '?')} tokens")
         if d.get("final_tokens") is not None:
             lines.append(f"实测待转发 {d['final_tokens']} tokens，闸门上限 {d.get('gate_tokens')} tokens")
+            if d.get("keep_recent_floor") and d.get("retained_tokens"):
+                lines.append(
+                    f"其中近期原文 {d['retained_tokens']} tokens 是硬性保留的"
+                    f"（keep_recent_tokens={d['keep_recent_floor']}），压缩不会动它。"
+                    "若长期卡在这里，说明 keep_recent_tokens 与 trigger_tokens 配置冲突，"
+                    "请调低前者或调高后者。")
         planned, done = d.get("batches_planned"), d.get("batches_done")
         if planned and done is not None and done < planned:
             lines.append(f"本次请求压了 {done}/{planned} 批就到达单请求上限（避免一个请求跑几十分钟）。"
@@ -138,6 +144,33 @@ def _pick_keep_from(rounds: list[tuple[int, int]], infos: list[M.MsgInfo],
         if acc >= keep_recent:
             break
     return max(already, keep_from)
+
+
+def _floor_retain(rounds: list[tuple[int, int]], infos: list[M.MsgInfo],
+                  upto: int, keep_recent: int, conv_id: str = "?") -> int:
+    """近期原文是**硬性下限**：只要这个会话压缩过，转发给上游的逐字原文就不得少于
+    ``keep_recent_tokens``（除非整个对话本身就没这么长）。
+
+    正常情况下"已压缩位置"天然满足——压缩切点本来就是按这个下限挑的。但有三种情况
+    会让存量的 ``compressed_upto`` 不再满足，此时必须把原文窗口**往回退**：
+
+    * 用户删掉了近期若干轮，已压缩位置一下子逼近消息列表末尾；
+    * 运行中调大了 ``keep_recent_tokens``，存量 checkpoint 的切点是按旧值定的；
+    * 旧库迁移来的 ``compressed_upto`` 出自另一套阈值。
+
+    回退意味着这几轮同时出现在摘要和原文里。重叠是无害的（提示词里明确以原文为准），
+    而原文不足是有害的。**只回退、不前推**，所以绝不会把尚未摘要的内容吞掉；
+    等下一次真正触发压缩时切点重算，重叠自动消失。
+    """
+    floor = _pick_keep_from(rounds, infos, 0, keep_recent)
+    if floor >= upto:
+        return upto
+    log.warning("[%s] 近期原文只剩 %d tokens(<%d 硬下限)，原文窗口从下标 %d 回退到 %d"
+                "（第 %d 轮起），这几轮会同时出现在摘要和原文里；"
+                "常见原因：用户删了近期消息 / 调大了 keep_recent_tokens / 旧库迁移的切点",
+                conv_id[:12], M.tokens_of(infos, upto, len(infos)), keep_recent,
+                upto, floor, M.rounds_before(rounds, floor) + 1)
+    return floor
 
 
 def _build_batches(rounds: list[tuple[int, int]], infos: list[M.MsgInfo],
@@ -229,6 +262,9 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
     already = max(0, min(located.already, len(body)))
     prev_summary = located.summary or ""
     is_fallback = located.mode == "fallback"
+    keep_recent = int(s["keep_recent_tokens"])
+    # 已压缩位置只决定"还要摘要什么"；实际发出去的原文从 retain_from 起，受硬下限保护
+    retain_from = _floor_retain(rounds, infos, already, keep_recent, conv_id or "new")
 
     for note in located.notes:
         log.info("[%s] %s", (conv_id or "new")[:12], note)
@@ -240,10 +276,9 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
 
     # ---- 阈值判断（用压缩后的等效总量，而不是全量原文）----
     trigger = int(s["trigger_tokens"])
-    keep_recent = int(s["keep_recent_tokens"])
     cap = int(s.get("summary_total_cap_tokens", 12800))
     summary_tokens = M.text_tokens(prev_summary)
-    tail_tokens = M.tokens_of(infos, already, len(infos))
+    tail_tokens = M.tokens_of(infos, retain_from, len(infos))
     effective = head_tokens + summary_tokens + tail_tokens
 
     base_meta = {
@@ -252,6 +287,9 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
         "raw_tokens": raw_tokens, "effective_tokens": effective,
         "compressed_upto": already, "round_upto": M.rounds_before(rounds, already),
         "fork_round": located.fork_round,
+        "body_tokens": M.tokens_of(infos, 0, len(infos)),
+        "retain_from": retain_from, "retained_tokens": tail_tokens,
+        "keep_recent_floor": keep_recent,
     }
 
     if effective < trigger:
@@ -260,9 +298,9 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
         if prev_summary and not is_fallback:
             log.info("[%s] 无需压缩：等效 %d tokens < %d｜复用摘要(%d tokens)｜"
                      "保留第 %d~%d 轮共 %d 条原文", (conv_id or "?")[:12], effective, trigger,
-                     summary_tokens, M.rounds_before(rounds, already) + 1, total_rounds,
-                     len(body) - already)
-            final = _assemble(head, prev_summary, body[already:])
+                     summary_tokens, M.rounds_before(rounds, retain_from) + 1, total_rounds,
+                     len(body) - retain_from)
+            final = _assemble(head, prev_summary, body[retain_from:])
             return _finish(final, provider, {**base_meta, "mode": "reuse"}, trigger, t0)
         log.info("[%s] 无需压缩：等效 %d tokens < %d｜共 %d 轮 %d 条原文，原样转发",
                  (conv_id or "new")[:12], effective, trigger, total_rounds, len(body))
@@ -296,8 +334,8 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
             prev_summary = new_summary
             base_meta["recompress"] = {"model": model, "parts": parts}
         log.info("[%s] 等效 %d tokens 超阈值但近期原文仅 %d tokens(<=%d)，复用摘要，保留 %d 条",
-                 conv_id[:12], effective, tail_tokens, keep_recent, len(body) - already)
-        final = _assemble(head, prev_summary, body[already:])
+                 conv_id[:12], effective, tail_tokens, keep_recent, len(body) - retain_from)
+        final = _assemble(head, prev_summary, body[retain_from:])
         return _finish(final, provider, {**base_meta, "mode": "reuse_over_trigger"}, trigger, t0)
 
     # ---- 开启 / 续接压缩事件 ----
@@ -383,7 +421,10 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
         log.warning("[%s] 达到单请求批次上限（%d/%d 批），带着已落盘进度返回，下次请求继续",
                     conv_id[:12], len(todo), planned)
 
-    final = _assemble(head, summary_text, body[done_upto:])
+    retain_final = _floor_retain(rounds, infos, done_upto, keep_recent, conv_id)
+    meta["retain_from"] = retain_final
+    meta["retained_tokens"] = M.tokens_of(infos, retain_final, len(infos))
+    final = _assemble(head, summary_text, body[retain_final:])
     return _finish(final, provider, meta, trigger, t0, rounds=rounds, infos=infos,
                    keep_from=keep_from, total_rounds=total_rounds)
 
@@ -470,7 +511,9 @@ async def _fallback_path(head, body, infos, rounds, cur_sig, key, conv_id, locat
 
     final = _assemble(head, summary_text, body[keep_from:], branch_warning=True)
     meta = {**base_meta, "mode": "fallback", "fallback_count": count,
-            "compressed_upto": keep_from, "round_upto": M.rounds_before(rounds, keep_from)}
+            "compressed_upto": keep_from, "round_upto": M.rounds_before(rounds, keep_from),
+            "retain_from": keep_from,
+            "retained_tokens": M.tokens_of(infos, keep_from, len(infos))}
     return _finish(final, provider, meta, trigger, t0, rounds=rounds, infos=infos,
                    keep_from=keep_from, total_rounds=total_rounds)
 
@@ -488,6 +531,14 @@ def _finish(final: list[dict], provider: dict[str, Any], meta: dict[str, Any],
     gate = int(trigger * ratio)
     meta.update({"final_tokens": final_tokens, "gate_tokens": gate,
                  "sanitize": stats, "elapsed_ms": int((time.time() - t0) * 1000)})
+
+    # 不变量兜底：只要还有原文可留，发出去的近期原文就不该低于硬下限。
+    # 结构上已经由 _floor_retain 保证，这里只做告警型自检，抓漏网的 bug 路径。
+    floor = int(meta.get("keep_recent_floor") or 0)
+    kept, avail = meta.get("retained_tokens"), meta.get("body_tokens")
+    if kept is not None and avail is not None and kept < floor and kept < avail:
+        log.error("近期原文下限被破坏：只留了 %d tokens（下限 %d，全部原文 %d，mode=%s）"
+                  "——这是 bug，请带日志反馈", kept, floor, avail, meta.get("mode"))
 
     if final_tokens > gate and meta.get("mode") != "disabled":
         remaining_rounds = None

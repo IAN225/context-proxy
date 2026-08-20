@@ -63,6 +63,20 @@ URL 里的 `<name>` 和 `config.yaml` 的 `providers[].name` 对不上。Base UR
 
 配一个 `summary.fallback` 备用模型能显著降低整条链路的失败率。
 
+### 日志出现「近期原文只剩 N tokens，原文窗口回退」
+
+不是故障，是下限保护在生效：这个会话存量的压缩位置留不够 `keep_recent_tokens` 了，
+代理把原文窗口往回退补足，被回退的那几轮会同时出现在摘要和原文里（冲突以原文为准）。
+日志会点明触发原因——用户删了近期消息 / 调大了 `keep_recent_tokens` / 旧库迁移的切点。
+
+下一次真正触发压缩后切点重算，重叠自动消失。如果**每一次请求都在回退**且从不消失，
+检查 `keep_recent_tokens` 是不是被调到和 `trigger_tokens` 一样大了——
+那样永远攒不出可压的新内容，会一直卡在重叠状态。
+
+如果 503 的错误信息里出现「keep_recent_tokens 与 trigger_tokens 配置冲突」，
+说明保住下限就必然超出出口闸门。代理的取舍是**下限优先、宁可报错**，
+不会偷偷少发原文。按提示调低 `keep_recent_tokens` 或调高 `trigger_tokens` 即可。
+
 ### 兜底频繁触发
 
 `/health` 的 `fallback_activations` 每涨一次，日志里都有一条：

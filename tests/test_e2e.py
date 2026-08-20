@@ -577,3 +577,103 @@ def test_legacy_sessions_table_is_migrated():
     assert r.status_code == 200, r.text
     s = sessions()[0]
     assert s["compressed_upto"] >= upto, "迁移过来的会话不该从 0 重压"
+
+
+# ---- 近期原文硬下限：压缩过的会话，任何路径都不能让原文低于 keep_recent_tokens ----
+
+def test_recent_verbatim_floor_survives_user_deleting_recent_messages():
+    """用户删掉近期若干轮后，compressed_upto 逼近末尾，原文窗口必须回退。"""
+    fresh()
+    history = convo(30)
+    assert post("mm", history).status_code == 200
+    upto = sessions()[0]["compressed_upto"]
+    assert upto > 0
+
+    # 砍掉压缩位置之后的绝大部分原文，只留 1 条
+    truncated = history[:1] + history[1:][:upto + 1]
+    r = post("mm", truncated)
+    assert r.status_code == 200, r.text
+    call = chat_calls()[-1]
+    # 摘要仍在，但原文窗口回退了：转发条数明显多于 "只剩 1 条"
+    assert call["roles"][1] == "system"
+    assert call["n_messages"] > 4, call["roles"]
+    # 已压缩位置本身没有被改写（只是展示窗口回退）
+    assert sessions()[0]["compressed_upto"] == upto
+
+
+def test_recent_verbatim_floor_survives_raising_keep_recent():
+    """运行中调大 keep_recent_tokens，存量 checkpoint 的切点按旧值定，必须回退补足。"""
+    fresh(keep_recent_tokens=300)
+    history = convo(30)
+    assert post("mm", history).status_code == 200
+    before = chat_calls()[-1]["n_messages"]
+    upto = sessions()[0]["compressed_upto"]
+
+    # 只调大下限，不动 DB
+    write_config(f"db/t{_counter['n']}.db", keep_recent_tokens=900)
+    app_module.do_reload()
+
+    r = post("mm", history)
+    assert r.status_code == 200, r.text
+    after = chat_calls()[-1]["n_messages"]
+    assert after > before, f"下限调大后原文应当变多: {before} -> {after}"
+    assert sessions()[0]["compressed_upto"] == upto, "只回退展示窗口，不改写已压缩位置"
+
+
+def test_recent_verbatim_floor_after_legacy_migration():
+    """旧库迁移来的 compressed_upto 出自另一套阈值，同样受下限保护。"""
+    _counter["n"] += 1
+    db_rel = f"db/floor{_counter['n']}.db"
+    db_abs = TMP / db_rel
+    db_abs.parent.mkdir(parents=True, exist_ok=True)
+
+    history = convo(30)
+    body = [m for m in history if m.get("role") != "system"]
+    from cproxy import messages as M
+    upto = len(body) - 2          # 旧库把原文几乎全压掉了，只剩一轮
+    conn = sqlite3.connect(db_abs)
+    conn.execute("CREATE TABLE sessions (conv_id TEXT PRIMARY KEY, summary TEXT, "
+                 "compressed_upto INTEGER, boundary_fp TEXT, ts REAL)")
+    conn.execute("INSERT INTO sessions VALUES (?,?,?,?,?)",
+                 (M.legacy_conv_id(body), "## 关键事实\n旧库摘要。", upto,
+                  M.legacy_boundary_fp(body[upto - 1]), time.time()))
+    conn.commit()
+    conn.close()
+
+    write_config(db_rel, keep_recent_tokens=1200)
+    app_module.do_reload()
+    httpx.post(f"{MOCK}/__reset", timeout=5)
+
+    r = post("mm", history)
+    assert r.status_code == 200, r.text
+    call = chat_calls()[-1]
+    assert call["n_messages"] > 4, f"迁移来的切点只剩 2 条原文，必须回退补足: {call['roles']}"
+
+
+def test_floor_never_pushes_window_forward_in_steady_state():
+    """稳态下不该有任何回退：原文窗口就等于已压缩位置，不产生重叠。"""
+    fresh()
+    history = convo(30)
+    assert post("mm", history).status_code == 200
+    upto = sessions()[0]["compressed_upto"]
+    n_after_compress = chat_calls()[-1]["n_messages"]
+
+    for k in range(3):
+        history = history + convo(1, start=700 + k, head=False)
+        assert post("mm", history).status_code == 200
+    call = chat_calls()[-1]
+    # 头部 system + 摘要 + (len(body) - upto) 条原文，一条不多一条不少
+    body_len = len([m for m in history if m.get("role") != "system"])
+    assert call["n_messages"] == 2 + (body_len - upto), call["roles"]
+    assert call["n_messages"] == n_after_compress + 6
+
+
+def test_floor_beats_gate_and_says_so():
+    """下限与出口闸门冲突时：宁可报错，也不偷偷少发原文，且报错要点明是配置打架。"""
+    fresh(trigger_tokens=1200, keep_recent_tokens=1500)
+    r = post("mm", convo(30))
+    assert r.status_code == 503
+    msg = r.json()["error"]["message"]
+    assert "keep_recent_tokens" in msg and "配置冲突" in msg
+    d = r.json()["error"]["detail"]
+    assert d["retained_tokens"] >= d["keep_recent_floor"], "任何情况下都不能低于下限"
