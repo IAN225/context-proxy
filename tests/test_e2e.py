@@ -709,3 +709,72 @@ def test_tool_call_bloat_is_refused_with_actionable_message():
     assert "工具调用" in msg and "编辑或缩短最后一条消息" in msg
     assert "避免在这一轮里让模型调用工具" in msg
     assert not chat_calls(), "绝不能把超标请求转发给上游"
+
+
+def _legacy_state(db_rel, history, upto, **cfg):
+    """造一个"已压缩到 upto、近期原文只剩几条"的存量会话（走旧库迁移那条路）。"""
+    from cproxy import messages as M
+    db_abs = TMP / db_rel
+    db_abs.parent.mkdir(parents=True, exist_ok=True)
+    body = [m for m in history if m.get("role") != "system"]
+    conn = sqlite3.connect(db_abs)
+    conn.execute("CREATE TABLE sessions (conv_id TEXT PRIMARY KEY, summary TEXT, "
+                 "compressed_upto INTEGER, boundary_fp TEXT, ts REAL)")
+    conn.execute("INSERT INTO sessions VALUES (?,?,?,?,?)",
+                 (M.legacy_conv_id(body), "## 关键事实与专有名词\n旧库留下的累积摘要。", upto,
+                  M.legacy_boundary_fp(body[upto - 1]), time.time()))
+    conn.commit()
+    conn.close()
+    write_config(db_rel, **cfg)
+    app_module.do_reload()
+    httpx.post(f"{MOCK}/__reset", timeout=5)
+
+
+def test_stuck_window_recovers_without_edit_and_survives_editing_last_message():
+    """复现"近期原文只剩 3 条"的存量状态，验证三件事：
+    1. 不需要用户做任何事，下一次请求窗口就自己回退补足；
+    2. 编辑最后一条消息不会打乱定位，也不会触发全量重压或兜底；
+    3. 对话继续增长后压缩正常推进，重叠自动消失（窗口不会永远停在回退状态）。
+    """
+    _counter["n"] += 1
+    history = convo(40)
+    body_len = len([m for m in history if m.get("role") != "system"])
+    upto = body_len - 3                      # 只剩 3 条原文
+    _legacy_state(f"db/stuck{_counter['n']}.db", history, upto,
+                  trigger_tokens=1200, keep_recent_tokens=400)
+
+    # 1) 什么都不改，直接发一次
+    r = post("mm", history)
+    assert r.status_code == 200, r.text
+    first = chat_calls()[-1]
+    assert first["n_messages"] > 3 + 2, f"窗口应当自动回退补足，实际只发了 {first['n_messages']} 条"
+    assert httpx.get(f"{PROXY}/health", timeout=5).json()["fallback_activations"] == 0
+    assert sessions()[0]["compressed_upto"] == upto, "只回退展示窗口，不改写已压缩位置"
+    n_summary = len(summary_calls())
+
+    # 迁移来的 checkpoint 已经补上指纹数组，从此能检测分叉
+    detail = session_detail(sessions()[0]["conv_id"])
+    assert detail["checkpoints"][0]["signature_len"] == body_len
+
+    # 2) 编辑最后一条消息后重发
+    edited = list(history)
+    edited[-1] = {"role": "assistant", "content": "【改写后的最后一条回答】" + FILLER * 2}
+    r = post("mm", edited)
+    assert r.status_code == 200, r.text
+    assert len(summary_calls()) == n_summary, "改最后一条不该触发重压"
+    assert httpx.get(f"{PROXY}/health", timeout=5).json()["fallback_activations"] == 0
+    assert sessions()[0]["compressed_upto"] == upto
+    assert chat_calls()[-1]["n_messages"] == first["n_messages"], "窗口位置保持一致"
+
+    # 3) 继续聊，直到攒够新内容触发压缩：压缩位置推进，重叠消失
+    grown = edited
+    for k in range(40):
+        grown = grown + convo(1, start=900 + k, head=False)
+        assert post("mm", grown).status_code == 200
+        if sessions()[0]["compressed_upto"] > upto:
+            break
+    s = sessions()[0]
+    assert s["compressed_upto"] > upto, "对话增长后压缩应当正常推进"
+    grown_body = len([m for m in grown if m.get("role") != "system"])
+    assert chat_calls()[-1]["n_messages"] == 2 + (grown_body - s["compressed_upto"]), \
+        "推进之后窗口就等于已压缩位置，不再重叠"

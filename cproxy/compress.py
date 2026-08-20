@@ -281,6 +281,18 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
                  located.fork_index, (located.checkpoint or {}).get("seq"),
                  M.rounds_before(rounds, already), already)
 
+    # 旧库迁移来的 checkpoint 没有指纹数组，分支检测对它是瞎的（只能靠一条边界指纹弱校验）。
+    # 认亲成功后立刻把当前指纹数组补上——否则这个会话要等到下一次真正触发压缩才有指纹，
+    # 而"原文窗口回退"期间可能很久都不触发压缩，这段时间里用户改早期消息是检测不到的。
+    ck0 = located.checkpoint
+    if (located.mode == "ok" and conv_id and ck0 is not None and st.enabled
+            and store.checkpoint_signature(ck0) is None):
+        await st.resume_event(int(ck0["id"]), already, M.rounds_before(rounds, already),
+                              total_rounds, len(body), cur_sig)
+        ck0["signature"] = cur_sig
+        log.info("[%s] 旧库迁移的 checkpoint seq=%s 补写指纹数组（%d 条），"
+                 "从下次请求起可正常检测分叉", conv_id[:12], ck0.get("seq"), len(cur_sig))
+
     # ---- 阈值判断（用压缩后的等效总量，而不是全量原文）----
     trigger = int(s["trigger_tokens"])
     cap = int(s.get("summary_total_cap_tokens", 12800))
