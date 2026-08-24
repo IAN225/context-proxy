@@ -163,10 +163,112 @@ async def admin_session(conv_id: str, request: Request):
             "total_rounds": c["total_rounds"], "msg_count": c["msg_count"],
             "signature_len": len(store.checkpoint_signature(c) or []) or None,
             "summary_tokens": M.text_tokens(c["summary"] or ""),
-            "summary": c["summary"],
+            # 全文走 /admin/session/{id}/summary，这里只给预览，否则十几条 checkpoint 刷屏
+            "summary_preview": (c["summary"] or "")[:400],
             "updated_at": c["updated_at"],
         } for c in cks],
     }
+
+
+async def _resolve_conv(conv_id: str):
+    st = store.get()
+    matched = await st.match_prefix(conv_id)
+    if not matched:
+        return None, None, JSONResponse(status_code=404, content={
+            "error": {"message": f"没有匹配 {conv_id!r} 的会话（支持 conv_id 前缀）"}})
+    if len(matched) > 1:
+        return None, None, JSONResponse(status_code=409, content={
+            "error": {"message": f"前缀 {conv_id!r} 匹配到 {len(matched)} 个会话，请写长一点",
+                      "candidates": [c[:16] for c in matched]}})
+    return matched[0], await st.get_conversation(matched[0]), None
+
+
+@app.get("/admin/session/{conv_id}/summary")
+async def get_summary(conv_id: str, request: Request, format: str = "json"):
+    """取当前生效的累积摘要全文。format=text 时直接返回纯文本，便于重定向到文件编辑。"""
+    if (denied := _check_auth(request)) is not None:
+        return denied
+    cid, _conv, err = await _resolve_conv(conv_id)
+    if err is not None:
+        return err
+    st = store.get()
+    ck = await st.latest_checkpoint(cid)
+    if ck is None:
+        return JSONResponse(status_code=404, content={
+            "error": {"message": "这个会话还没有任何 checkpoint（尚未触发过压缩）"}})
+    if format == "text":
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(ck["summary"] or "")
+    open_ev = await st.open_event_checkpoint(cid)
+    return {
+        "conv_id": cid,
+        "base_seq": ck["seq"],          # 回写时带上它做乐观并发校验
+        "kind": ck["kind"], "status": ck["status"],
+        "compressed_upto": ck["compressed_upto"], "round_upto": ck["round_upto"],
+        "total_rounds": ck["total_rounds"],
+        "summary_tokens": M.text_tokens(ck["summary"] or ""),
+        "summary_cap_tokens": config.summary().get("summary_total_cap_tokens"),
+        "editable": open_ev is None,
+        "open_event_seq": open_ev["seq"] if open_ev else None,
+        "summary": ck["summary"] or "",
+    }
+
+
+@app.put("/admin/session/{conv_id}/summary")
+async def put_summary(conv_id: str, request: Request):
+    """手工改写累积摘要。写成一条新的 manual checkpoint，原来那条留着可回退。
+
+    body: {"summary": "...", "base_seq": N}
+    base_seq 是乐观锁：取回摘要之后如果又发生过压缩，seq 会变，这里直接拒绝，
+    避免把模型刚压出来的新内容覆盖掉。
+    """
+    if (denied := _check_auth(request)) is not None:
+        return denied
+    payload = await request.json()
+    text = payload.get("summary")
+    if not isinstance(text, str) or not text.strip():
+        return JSONResponse(status_code=400, content={
+            "error": {"message": "summary 不能为空；想清空整个会话状态请用 /admin/clean"}})
+    text = text.strip()
+
+    cid, conv, err = await _resolve_conv(conv_id)
+    if err is not None:
+        return err
+    st = store.get()
+
+    # 和压缩流程抢同一把会话锁，避免和正在跑的压缩交错写
+    async with compress.conversation_lock((conv or {}).get("conv_key"), cid):
+        ck = await st.latest_checkpoint(cid)
+        if ck is None:
+            return JSONResponse(status_code=404, content={
+                "error": {"message": "这个会话还没有任何 checkpoint（尚未触发过压缩）"}})
+        if ck["status"] == "partial":
+            return JSONResponse(status_code=409, content={"error": {"message":
+                f"会话正在压缩中（事件 seq={ck['seq']} 未完成），现在改会和它打架。"
+                "等这轮压完（再发一条消息推进它）再改。"}})
+        base_seq = payload.get("base_seq")
+        if base_seq is not None and int(base_seq) != int(ck["seq"]):
+            return JSONResponse(status_code=409, content={"error": {"message":
+                f"摘要已被更新（你基于 seq={base_seq}，当前是 seq={ck['seq']}），"
+                "请重新取一次再改，以免覆盖掉新压出来的内容。"}})
+
+        tokens = M.text_tokens(text)
+        cap = int(config.summary().get("summary_total_cap_tokens", 12800))
+        if tokens > cap:
+            return JSONResponse(status_code=400, content={"error": {"message":
+                f"摘要 {tokens} tokens 超过 summary_total_cap_tokens={cap}，"
+                "超了会在下次压缩时被自动二次重压、把你的改动洗掉。请精简后再存。"}})
+
+        seq = await st.add_manual_checkpoint(cid, int(ck["id"]), text,
+                                             int(config.summary().get("checkpoint_keep", 10)))
+    old_tokens = M.text_tokens(ck["summary"] or "")
+    log.warning("[%s] 摘要被手工改写：seq %s -> %s（%d -> %d tokens），"
+                "位置信息沿用第 %s 轮 / 下标 %s，原 checkpoint 保留可回退",
+                cid[:12], ck["seq"], seq, old_tokens, tokens,
+                ck["round_upto"], ck["compressed_upto"])
+    return {"status": "updated", "conv_id": cid, "new_seq": seq, "base_seq": ck["seq"],
+            "summary_tokens": tokens, "previous_summary_tokens": old_tokens,
+            "note": "下一次请求即生效；后续压缩会在此基础上追加"}
 
 
 @app.post("/admin/clean")

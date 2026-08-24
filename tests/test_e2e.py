@@ -454,8 +454,8 @@ def test_recompress_writes_new_checkpoint_and_keeps_history():
     kinds = [c["kind"] for c in detail["checkpoints"]]
     assert "recompress" in kinds, kinds
     assert any(c["pinned"] for c in detail["checkpoints"]), "最早的 checkpoint 必须永久保留"
-    # 二次重压走的是 merge 提示词，不会产生多份同名章节
-    merged = next(c for c in detail["checkpoints"] if c["kind"] == "recompress")["summary"]
+    # 二次重压走的是 merge 提示词，不会产生多份同名章节（全文从 /summary 取）
+    merged = _summary_api(sessions()[0]["conv_id"]).json()["summary"]
     assert merged.count("## 用户背景与偏好") <= 1
 
 
@@ -778,3 +778,115 @@ def test_stuck_window_recovers_without_edit_and_survives_editing_last_message():
     grown_body = len([m for m in grown if m.get("role") != "system"])
     assert chat_calls()[-1]["n_messages"] == 2 + (grown_body - s["compressed_upto"]), \
         "推进之后窗口就等于已压缩位置，不再重叠"
+
+
+# ---- 手工查看 / 修改摘要 ----
+
+def _summary_api(conv_id, **kw):
+    return httpx.get(f"{PROXY}/admin/session/{conv_id}/summary", headers=HEADERS,
+                     params=kw, timeout=10)
+
+
+def _put_summary(conv_id, text, base_seq=None):
+    body = {"summary": text}
+    if base_seq is not None:
+        body["base_seq"] = base_seq
+    return httpx.put(f"{PROXY}/admin/session/{conv_id}/summary", headers=HEADERS,
+                     json=body, timeout=10)
+
+
+def test_manual_summary_view_and_edit_takes_effect():
+    fresh()
+    history = convo(30)
+    assert post("mm", history).status_code == 200
+    cid = sessions()[0]["conv_id"]
+
+    got = _summary_api(cid).json()
+    assert got["summary"] and got["editable"] is True
+    assert got["base_seq"] == 1 and got["total_rounds"] == 30
+    # 纯文本视图，方便重定向到文件
+    assert _summary_api(cid, format="text").text == got["summary"]
+
+    hand = "## 用户背景与偏好\n用户叫小苦，讨厌被叫全名。\n## 关键事实与专有名词\n- 猫叫豆豆"
+    r = _put_summary(cid, hand, base_seq=got["base_seq"])
+    assert r.status_code == 200, r.text
+    assert r.json()["new_seq"] == 2
+
+    # 原 checkpoint 留着可回退，新的是 manual
+    detail = session_detail(cid)
+    kinds = {c["seq"]: c["kind"] for c in detail["checkpoints"]}
+    assert kinds[2] == "manual" and kinds[1] == "incremental"
+
+    # 下一次请求就用改过的摘要，且位置信息原样沿用
+    assert post("mm", history).status_code == 200
+    sysmsg = chat_calls()[-1]["system_preview"]
+    assert _summary_api(cid).json()["summary"] == hand
+    assert sessions()[0]["compressed_upto"] == detail["checkpoints"][0]["compressed_upto"]
+
+
+def test_manual_summary_is_carried_forward_by_later_compression():
+    fresh()
+    history = convo(30)
+    assert post("mm", history).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    hand = "## 关键事实与专有名词\n- 这段是人写的，后续压缩必须保留它"
+    assert _put_summary(cid, hand).status_code == 200
+
+    grown = history + convo(30, start=400)
+    assert post("mm", grown).status_code == 200
+    now = _summary_api(cid).json()["summary"]
+    assert now.startswith(hand), "后续压缩应当在手工摘要之后追加，而不是覆盖"
+
+
+def test_manual_summary_rejects_stale_base_seq_and_open_event():
+    fresh()
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    seq = _summary_api(cid).json()["base_seq"]
+
+    assert _put_summary(cid, "改动一", base_seq=seq).status_code == 200
+    # 拿着旧的 base_seq 再存 -> 409，不会覆盖别人的更新
+    r = _put_summary(cid, "改动二", base_seq=seq)
+    assert r.status_code == 409 and "已被更新" in r.json()["error"]["message"]
+    assert _summary_api(cid).json()["summary"] == "改动一"
+
+    # 压缩事件没收尾时拒绝编辑
+    fresh(max_batches_per_request=1)
+    post("mm", convo(60))
+    cid2 = sessions()[0]["conv_id"]
+    assert _summary_api(cid2).json()["editable"] is False
+    r = _put_summary(cid2, "趁着压缩没完偷偷改")
+    assert r.status_code == 409 and "正在压缩中" in r.json()["error"]["message"]
+
+
+def test_manual_summary_rejects_empty_and_over_cap():
+    fresh(summary_total_cap_tokens=200)
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    assert _put_summary(cid, "   ").status_code == 400
+    r = _put_summary(cid, "太长了" * 500)
+    assert r.status_code == 400 and "summary_total_cap_tokens" in r.json()["error"]["message"]
+
+
+def test_ctl_sh_edit_round_trip():
+    """真跑一遍 ./ctl.sh edit，用假编辑器改写文件。"""
+    import subprocess
+    fresh()
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+
+    fake_editor = TMP / "fake_editor.sh"
+    fake_editor.write_text("#!/bin/sh\nprintf '%s' '## 关键事实与专有名词\\n- 由 ctl.sh 写入' > \"$1\"\n")
+    fake_editor.chmod(0o755)
+    env = {**os.environ, "EDITOR": str(fake_editor), "PROXY_AUTH_TOKEN": TOKEN,
+           "PROXY_PORT": str(PROXY_PORT)}
+
+    out = subprocess.run(["bash", str(ROOT / "ctl.sh"), "summary", cid[:12]],
+                         capture_output=True, text=True, env=env, cwd=ROOT)
+    assert out.returncode == 0 and "##" in out.stdout, out
+
+    out = subprocess.run(["bash", str(ROOT / "ctl.sh"), "edit", cid[:12]],
+                         capture_output=True, text=True, env=env, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    assert '"status": "updated"' in out.stdout, out.stdout
+    assert "由 ctl.sh 写入" in _summary_api(cid).json()["summary"]

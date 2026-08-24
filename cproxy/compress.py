@@ -100,6 +100,15 @@ def _lock_for(key: str) -> asyncio.Lock:
     return lk
 
 
+def conversation_lock(conv_key: str | None, conv_id: str) -> asyncio.Lock:
+    """给管理接口用：拿到和 prepare() 同一把会话锁。
+
+    prepare() 是在知道 conv_id 之前就要上锁的（上锁才能安全地查会话），
+    所以锁键用的是 conv_key。管理接口只有 conv_id，从会话表里回查 conv_key 即可对上。
+    """
+    return _lock_for(conv_key or f"cid:{conv_id}")
+
+
 # ===== 组装 =====
 def _summary_message(summary_text: str, *, branch_warning: bool) -> dict:
     p = config.prompts()

@@ -136,9 +136,39 @@ systemctl status context-proxy
 ./ctl.sh reload              # 热重载 config.yaml（除 tokenizer.encoding 外全部字段都能热改）
 ./ctl.sh log                 # 实时日志
 ./ctl.sh sessions            # 所有会话的压缩进度
-./ctl.sh session <id前几位>   # 某会话的全部 checkpoint 与摘要全文
+./ctl.sh session <id前几位>   # 某会话的全部 checkpoint（摘要只给预览）
+./ctl.sh summary <id前几位>   # 打印当前生效的摘要全文
+./ctl.sh edit <id前几位>      # 用 $EDITOR 直接改摘要（见下节）
 ./ctl.sh clean <id前几位>     # 清除某会话（下次从头重压）
 ./ctl.sh clean all           # 清除全部（需二次确认）
+```
+
+## 摘要不满意？手动改
+
+摘要模型压出来的东西不好使时，可以直接改，改完下一次请求就生效：
+
+```bash
+./ctl.sh sessions                 # 找到 conv_id
+./ctl.sh summary a1b2c3d4         # 先看看现在是什么
+EDITOR=nano ./ctl.sh edit a1b2c3d4   # 拉到编辑器里改，保存即写回
+```
+
+改动会写成一条新的 `manual` checkpoint，**原来那条留在链上可以回退**；位置信息
+（压到第几轮、指纹数组）整套沿用，不影响定位。后续压缩会在你写的内容**之后追加**，
+不会覆盖掉。
+
+几条保护：
+
+- 摘要正被压缩事件占用时拒绝写入（提示等这轮压完），避免和压缩交错写；
+- 带 `base_seq` 乐观锁，取回之后如果又压过一次，写回会被拒绝，不会覆盖新压出来的内容；
+- 超过 `summary_total_cap_tokens` 拒绝保存——否则下次会触发二次重压把你的改动洗掉。
+
+也可以走 HTTP 接口接自己的界面：
+
+```
+GET  /admin/session/{conv_id}/summary            # JSON，含 base_seq / token 数 / 是否可编辑
+GET  /admin/session/{conv_id}/summary?format=text # 纯文本
+PUT  /admin/session/{conv_id}/summary            # {"summary": "...", "base_seq": N}
 ```
 
 `/health` 里有几个值得盯的字段：

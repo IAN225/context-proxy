@@ -239,6 +239,30 @@ COMMIT;
 
 ---
 
+## 3.6 手工改写摘要
+
+摘要模型压出来的东西不理想时，可以直接改（`./ctl.sh edit <id>`，或 `PUT
+/admin/session/{id}/summary`）。实现上刻意复用了已有的 checkpoint 模型，没有另开机制：
+
+* 改动写成一条 **`kind='manual'` 的新 checkpoint**，位置信息（`compressed_upto` /
+  `round_upto` / `signature`）整套从被编辑的那条 SQL 层面复制过来——用户只改了摘要文字，
+  历史对齐关系没有变。原 checkpoint 留在链上，改坏了照常能回退。
+* 因为 `choose_checkpoint()` 是按 `seq` 倒序挑第一个可用的，新写的 manual 自然接管；
+  下一次压缩事件以它为基线往后追加，所以手写内容不会被覆盖。
+
+三道保护，都是这个架构里已经存在的风险点：
+
+| 风险 | 保护 |
+|---|---|
+| 和正在跑的压缩交错写 | 管理接口拿的是**同一把会话锁**（`compress.conversation_lock()`）；另外只要还有 `partial` 事件就直接拒绝 |
+| 取回之后又压了一次，写回把新内容盖掉 | `base_seq` 乐观锁，seq 对不上就 409 |
+| 手写内容超过 `summary_total_cap_tokens` | 拒绝保存——否则下次压缩会触发二次重压，把人写的东西洗成模型的话 |
+
+锁这里有个细节：`prepare()` 是在知道 `conv_id` 之前就要上锁的（上锁才能安全地查会话），
+所以锁键用的是 `conv_key`；管理接口只有 `conv_id`，从会话表回查 `conv_key` 才能拿到同一把锁。
+
+---
+
 ## 4. 并发与性能
 
 服务器是 2 核 4G 的轻量云主机，还要跑 1panel + 一个 chatbox + 一个 CPU-only 的 ollama，

@@ -89,6 +89,24 @@ URL 里的 `<name>` 和 `config.yaml` 的 `providers[].name` 对不上。Base UR
 是这条路径最常见的成因。按提示编辑或缩短最后一条消息后重发，
 并避免在这一轮让模型调用工具；反复出现则说明 `trigger_tokens` 对这个对话设得太小。
 
+### 摘要质量不行 / 想手工改
+
+```bash
+./ctl.sh summary <id前几位>        # 看当前生效的摘要全文
+EDITOR=nano ./ctl.sh edit <id前几位>  # 改完保存即写回，下次请求生效
+```
+
+改动写成新的 `manual` checkpoint，原来那条留着可回退。写回被拒的三种情况：
+
+| 提示 | 原因 |
+|---|---|
+| `正在压缩中（事件 seq=N 未完成）` | 有 `partial` 事件没收尾。再发一条消息把它推进完，或等它压完 |
+| `摘要已被更新（你基于 seq=X，当前是 seq=Y）` | 取回之后又压过一次。重新 `edit` 一遍再改 |
+| `超过 summary_total_cap_tokens` | 写太长了。超了会在下次压缩时被自动二次重压洗掉，所以直接拦住 |
+
+想让摘要模型本身压得更好，就调 `summary.prompts.batch_system`（热重载生效），
+或者换一个更强的 `summary.model`。
+
 ### 兜底频繁触发
 
 `/health` 的 `fallback_activations` 每涨一次，日志里都有一条：
