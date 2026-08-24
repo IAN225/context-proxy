@@ -197,7 +197,9 @@ EDITOR=nano ./ctl.sh edit <id前几位>  # 改完保存即写回，下次请求�
 
 ```bash
 ./ctl.sh sessions                 # 所有会话：压到第几轮、checkpoint 数、状态
-./ctl.sh session <id前几位>        # 该会话全部 checkpoint：seq / kind / pinned / 摘要全文
+./ctl.sh session <id前几位>        # 该会话全部 checkpoint：seq / kind / pinned / 摘要预览
+./ctl.sh summary <id前几位>        # 当前生效的摘要全文
+./ctl.sh edit <id前几位>           # 手工改写摘要
 ```
 
 `kind` 的含义：
@@ -207,6 +209,7 @@ EDITOR=nano ./ctl.sh edit <id前几位>  # 改完保存即写回，下次请求�
 | `incremental` | 正常的增量压缩事件 |
 | `recompress` | 累积摘要超 cap 后的二次重压结果 |
 | `fallback` | 定位兜底时写下的状态 |
+| `manual` | 手工改写摘要写下的 |
 | `migrated` | 从旧 `sessions` 表迁移过来的，`signature` 为 null |
 
 `pinned=1` 的那条是永久保留的最早 checkpoint，兜底时用它的摘要。
