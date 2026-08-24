@@ -167,6 +167,11 @@ server:
   host: "0.0.0.0"
   port: 8787
   auth_token: "sk-proxy-forTarlinChat"         # 代理自身鉴权 token（环境变量 PROXY_AUTH_TOKEN 优先，留空则不鉴权）
+                                               # 这个要填进 chatbox，会跟着每个对话请求走
+  ui_token: ""                                 # 可视化页面 http://<IP>:<port>/ui 的登录密钥，建议 16 位
+                                               # 【留空 = 不启用页面】，环境变量 PROXY_UI_TOKEN 优先
+                                               # 用 ./ctl.sh ui-token 生成一个；它只能访问 /admin/*，
+                                               # 不能用来调 /chat/completions，和 auth_token 互不通用
 
 # ===== 日志 =====
 logging:

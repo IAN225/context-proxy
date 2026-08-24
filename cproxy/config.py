@@ -61,6 +61,9 @@ FALLBACK_PROMPTS: dict[str, str] = {
 # 所以配置里写多大都没用，实际生效值在这里封顶。
 KEEP_RECENT_MAX_RATIO = 0.5
 
+# 可视化页面密钥的建议长度。短于这个只警告不拦截，但页面能看到全部摘要，别图省事。
+UI_TOKEN_MIN_LEN = 16
+
 
 class ConfigError(RuntimeError):
     pass
@@ -141,7 +144,12 @@ def reload(warn=lambda *a, **k: None) -> dict[str, Any]:
         "summary_fallback": _resolve_secret("SUMMARY_FALLBACK_API_KEY",
                                             cfg["summary"]["fallback"].get("api_key")),
         "auth": _resolve_secret("PROXY_AUTH_TOKEN", cfg["server"].get("auth_token")),
+        "ui": _resolve_secret("PROXY_UI_TOKEN", cfg["server"].get("ui_token")),
     }
+    if secrets["ui"] and len(secrets["ui"]) < UI_TOKEN_MIN_LEN:
+        warn("server.ui_token 只有 %d 位，建议至少 %d 位——这个页面能看到全部对话摘要，"
+             "而且往往开在公网端口上（用 ./ctl.sh ui-token 生成一个）",
+             len(secrets["ui"]), UI_TOKEN_MIN_LEN)
     with _LOCK:
         global _CONFIG, _PROVIDERS, _SECRETS
         _CONFIG, _PROVIDERS, _SECRETS = cfg, providers, secrets
@@ -195,6 +203,16 @@ def provider(name: str) -> dict[str, Any] | None:
 
 def auth_token() -> str | None:
     return _SECRETS.get("auth")
+
+
+def ui_token() -> str | None:
+    """可视化页面的独立密钥。留空 = 不启用页面（/ui 直接 404）。
+
+    刻意和 server.auth_token 分开：那个要填进 chatbox、会跟着每个对话请求走，
+    拿它当管理后台密码等于把后台钥匙散出去。ui_token 只能访问 /admin/*，
+    不能拿去调 /chat/completions。
+    """
+    return _SECRETS.get("ui")
 
 
 def summary_endpoints() -> list[dict[str, Any]]:

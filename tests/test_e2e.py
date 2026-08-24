@@ -48,7 +48,10 @@ BASE_SUMMARY = {
 }
 
 
-def write_config(db_name: str, **summary_overrides) -> None:
+UI_TOKEN = "uiTOKEN0123456789"
+
+
+def write_config(db_name: str, ui_token: str = "", **summary_overrides) -> None:
     cfg = {
         "providers": [
             {"name": "mm", "base_url": f"{MOCK}/v1", "api_key": "sk-up",
@@ -59,7 +62,8 @@ def write_config(db_name: str, **summary_overrides) -> None:
         "summary": {**BASE_SUMMARY, "persist_db": db_name, **summary_overrides},
         "stream": {"smooth_chars": 8, "smooth_delay": 0.001, "flush_backlog_chars": 200},
         "tokenizer": {"encoding": "cl100k_base", "per_message_overhead": 4, "image_tokens": 1100},
-        "server": {"host": "127.0.0.1", "port": PROXY_PORT, "auth_token": TOKEN},
+        "server": {"host": "127.0.0.1", "port": PROXY_PORT, "auth_token": TOKEN,
+                   "ui_token": ui_token},
         "logging": {"level": "INFO", "file": "logs/proxy.log"},
     }
     CFG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -101,10 +105,12 @@ def servers():
 _counter = {"n": 0}
 
 
-def fresh(**summary_overrides) -> None:
+def fresh(ui_token: str = "", **summary_overrides) -> None:
     """给每个用例一个干净的 DB 和配置。"""
     _counter["n"] += 1
-    write_config(f"db/t{_counter['n']}.db", **summary_overrides)
+    from cproxy import app as _a
+    _a._FAIL.clear()                      # 清掉上个用例攒下的鉴权失败计数
+    write_config(f"db/t{_counter['n']}.db", ui_token=ui_token, **summary_overrides)
     app_module.do_reload()
     httpx.post(f"{MOCK}/__reset", timeout=5)
 
@@ -890,3 +896,64 @@ def test_ctl_sh_edit_round_trip():
     assert out.returncode == 0, out.stderr
     assert '"status": "updated"' in out.stdout, out.stdout
     assert "由 ctl.sh 写入" in _summary_api(cid).json()["summary"]
+
+
+# ---- 可视化页面与鉴权 ----
+
+def test_ui_disabled_without_token():
+    fresh()
+    r = httpx.get(f"{PROXY}/ui", timeout=5)
+    assert r.status_code == 404
+    assert "ui_token" in r.json()["error"]["message"]
+
+
+def test_ui_page_served_when_token_set():
+    fresh(ui_token=UI_TOKEN)
+    r = httpx.get(f"{PROXY}/ui", timeout=5)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    body = r.text
+    assert "context-proxy" in body and "ui_token" in body
+    # 自包含：不引任何外部资源
+    assert "http://" not in body.replace("http://127.0.0.1", "") or "cdn" not in body.lower()
+    assert "<script src" not in body and "<link" not in body
+    # 密钥绝不能出现在页面里
+    assert UI_TOKEN not in body
+
+
+def test_ui_token_reaches_admin_but_not_chat():
+    fresh(ui_token=UI_TOKEN)
+    ui_h = {"Authorization": f"Bearer {UI_TOKEN}"}
+    assert httpx.get(f"{PROXY}/admin/sessions", headers=ui_h, timeout=5).status_code == 200
+    # ui_token 不能拿来调对话接口（不然等于把付费通道也交出去了）
+    r = httpx.post(f"{PROXY}/mm/v1/chat/completions", headers=ui_h,
+                   json={"model": "mock-chat", "messages": convo(2)}, timeout=10)
+    assert r.status_code == 401
+    # auth_token 仍然两边都能用，ctl.sh 不受影响
+    assert httpx.get(f"{PROXY}/admin/sessions", headers=HEADERS, timeout=5).status_code == 200
+    assert post("mm", convo(2)).status_code == 200
+
+
+def test_wrong_key_is_rejected_then_throttled():
+    fresh(ui_token=UI_TOKEN)
+    bad = {"Authorization": "Bearer wrong-key-here"}
+    codes = [httpx.get(f"{PROXY}/admin/sessions", headers=bad, timeout=5).status_code
+             for _ in range(12)]
+    assert codes[0] == 401
+    assert 429 in codes, f"连续错误应当触发限流: {codes}"
+    # 限流是按来源计的，正确密钥此时也会被挡（同一来源），清掉计数后恢复
+    from cproxy import app as _a
+    _a._FAIL.clear()
+    assert httpx.get(f"{PROXY}/admin/sessions", headers=HEADERS, timeout=5).status_code == 200
+
+
+def test_ui_summary_edit_flow_through_admin_api():
+    """页面用的就是这几个接口，用 ui_token 完整走一遍。"""
+    fresh(ui_token=UI_TOKEN)
+    assert post("mm", convo(30)).status_code == 200
+    ui_h = {"Authorization": f"Bearer {UI_TOKEN}"}
+    cid = httpx.get(f"{PROXY}/admin/sessions", headers=ui_h, timeout=5).json()["sessions"][0]["conv_id"]
+    got = httpx.get(f"{PROXY}/admin/session/{cid}/summary", headers=ui_h, timeout=5).json()
+    r = httpx.put(f"{PROXY}/admin/session/{cid}/summary", headers=ui_h, timeout=5,
+                  json={"summary": "## 关键事实\n页面改的", "base_seq": got["base_seq"]})
+    assert r.status_code == 200 and r.json()["new_seq"] == got["base_seq"] + 1

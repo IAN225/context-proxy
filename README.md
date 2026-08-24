@@ -143,6 +143,27 @@ systemctl status context-proxy
 ./ctl.sh clean all           # 清除全部（需二次确认）
 ```
 
+## 可视化页面
+
+想在浏览器里看和改，先设一个登录密钥（和 chatbox 用的 `auth_token` 是两把钥匙）：
+
+```bash
+./ctl.sh ui-token                 # 生成 16 位随机密钥
+# 填进 config.yaml 的 server.ui_token，然后
+./ctl.sh reload
+```
+
+打开 `http://<服务器IP>:8787/ui` 输入密钥即可。页面能看会话列表与压缩进度、
+checkpoint 链、当前生效的摘要全文，并直接编辑保存。
+
+- **`ui_token` 留空 = 页面整个不存在**（`/ui` 返回 404），不会不小心把后台裸奔在公网上；
+- 它**只能访问 `/admin/*`，不能用来调 `/chat/completions`**——和 `auth_token` 互不通用；
+- 密钥只存在浏览器的 sessionStorage 里，关掉标签页就没了；
+- 页面零外部依赖（不引 CDN），断网 / 内网机器都能打开；
+- 连续输错 10 次会被限流。
+
+> 这个页面能看到全部对话摘要。别用弱密钥，也建议只在内网、或加了 HTTPS 的反代后面开放。
+
 ## 摘要不满意？手动改
 
 摘要模型压出来的东西不好使时，可以直接改，改完下一次请求就生效：
@@ -163,7 +184,7 @@ EDITOR=nano ./ctl.sh edit a1b2c3d4   # 拉到编辑器里改，保存即写回
 - 带 `base_seq` 乐观锁，取回之后如果又压过一次，写回会被拒绝，不会覆盖新压出来的内容；
 - 超过 `summary_total_cap_tokens` 拒绝保存——否则下次会触发二次重压把你的改动洗掉。
 
-也可以走 HTTP 接口接自己的界面：
+除了上面的[可视化页面](#可视化页面)，也可以直接调接口接自己的界面：
 
 ```
 GET  /admin/session/{conv_id}/summary            # JSON，含 base_seq / token 数 / 是否可编辑
@@ -199,7 +220,8 @@ cproxy/store.py       SQLite：会话、checkpoint、指纹倒排、旧库迁移
 cproxy/locate.py      会话匹配与分支点检测
 cproxy/summarizer.py  摘要模型调用：重试分类、fallback、二次重压
 cproxy/compress.py    压缩主流程
-cproxy/app.py         路由、流式转发、管理接口
+cproxy/app.py         路由、鉴权、流式转发、管理接口
+cproxy/ui.py          内嵌的可视化页面（单文件，零外部依赖）
 config.yaml           配置（含四套提示词）
 ctl.sh                管理脚本
 tests/                单测 + 端到端测试（假上游）

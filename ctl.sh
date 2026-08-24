@@ -78,6 +78,10 @@ case "${1:-status}" in
     [ -z "${2:-}" ] && { echo "用法: $0 session <conv_id 前几位>"; exit 1; }
     _api GET "/admin/session/$2"
     ;;
+  ui-token)
+    python3 -c "import secrets,string; a=string.ascii_letters+string.digits; print(''.join(secrets.choice(a) for _ in range(16)))"
+    echo "把它填进 config.yaml 的 server.ui_token，然后 $0 reload；页面地址 http://<服务器IP>:$PORT/ui" >&2
+    ;;
   summary)
     [ -z "${2:-}" ] && { echo "用法: $0 summary <conv_id 前几位>"; exit 1; }
     curl -s -H "Authorization: Bearer $TOKEN" \
@@ -133,7 +137,7 @@ PY
   log) tail -f "$LOG" ;;
   errlog) tail -f "$STDERR_LOG" ;;
   *)
-    echo "用法: $0 {start|stop|restart|reload|status|log|errlog|sessions|session <id>|summary <id>|edit <id>|clean all|clean <id>}"
+    echo "用法: $0 {start|stop|restart|reload|status|log|errlog|sessions|session <id>|summary <id>|edit <id>|ui-token|clean all|clean <id>}"
     exit 1
     ;;
 esac

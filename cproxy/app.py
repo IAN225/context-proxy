@@ -3,18 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
 import logging
 import signal
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
-from . import compress, config, logging_setup, store
+from . import compress, config, logging_setup, store, ui
 from . import messages as M
 
 log = logging.getLogger("proxy")
@@ -60,17 +62,62 @@ def do_reload() -> dict[str, Any]:
     return summary
 
 
-# ===== 工具 =====
-def _check_auth(request: Request) -> JSONResponse | None:
-    token = config.auth_token()
-    if not token:
-        return None
+# ===== 鉴权 =====
+# 失败计数：16 位密钥被在线暴力破解并不现实，但这个端口通常开在公网上，
+# 挡一下能顺带把扫描器的日志噪音压下去。
+_FAIL: "OrderedDict[str, list[float]]" = OrderedDict()
+_FAIL_WINDOW = 300.0
+_FAIL_MAX = 10
+
+
+def _client_ip(request: Request) -> str:
+    return (request.client.host if request.client else "?") or "?"
+
+
+def _throttled(ip: str) -> bool:
+    now = time.time()
+    hits = [t for t in _FAIL.get(ip, []) if now - t < _FAIL_WINDOW]
+    if hits:
+        _FAIL[ip] = hits
+    elif ip in _FAIL:
+        del _FAIL[ip]
+    return len(hits) >= _FAIL_MAX
+
+
+def _record_fail(ip: str) -> None:
+    _FAIL.setdefault(ip, []).append(time.time())
+    _FAIL.move_to_end(ip)
+    while len(_FAIL) > 1024:
+        _FAIL.popitem(last=False)
+
+
+def _bearer(request: Request) -> str:
     auth = request.headers.get("authorization", "")
-    got = auth[7:].strip() if auth.lower().startswith("bearer ") else auth.strip()
-    if got != token:
-        return JSONResponse(status_code=401,
-                            content={"error": {"message": "unauthorized", "type": "auth_error"}})
-    return None
+    return auth[7:].strip() if auth.lower().startswith("bearer ") else auth.strip()
+
+
+def _check_auth(request: Request, *, admin: bool = False) -> JSONResponse | None:
+    """对话接口只认 auth_token；管理接口额外接受 ui_token。
+
+    两者刻意分开：auth_token 要填进 chatbox、跟着每个对话请求走，
+    拿它当后台密码等于把后台钥匙散出去。
+    """
+    accepted = [t for t in ([config.auth_token()] +
+                            ([config.ui_token()] if admin else [])) if t]
+    if not accepted:
+        return None
+    ip = _client_ip(request)
+    if _throttled(ip):
+        return JSONResponse(status_code=429, content={"error": {
+            "message": "密钥错误次数过多，请稍后再试", "type": "auth_error"}})
+    got = _bearer(request)
+    # compare_digest 防时序侧信道；两个都比一遍，不因为先匹配到就早退
+    if any(hmac.compare_digest(got, t) for t in accepted):
+        return None
+    _record_fail(ip)
+    log.warning("鉴权失败：%s %s（来自 %s）", request.method, request.url.path, ip)
+    return JSONResponse(status_code=401,
+                        content={"error": {"message": "unauthorized", "type": "auth_error"}})
 
 
 def _sse(obj: dict) -> bytes:
@@ -123,7 +170,7 @@ async def health():
 
 @app.post("/admin/reload")
 async def admin_reload(request: Request):
-    if (denied := _check_auth(request)) is not None:
+    if (denied := _check_auth(request, admin=True)) is not None:
         return denied
     try:
         return {"status": "reloaded", **do_reload()}
@@ -135,7 +182,7 @@ async def admin_reload(request: Request):
 
 @app.get("/admin/sessions")
 async def admin_sessions(request: Request, limit: int = 100):
-    if (denied := _check_auth(request)) is not None:
+    if (denied := _check_auth(request, admin=True)) is not None:
         return denied
     rows = await store.get().list_conversations(limit)
     for r in rows:
@@ -146,7 +193,7 @@ async def admin_sessions(request: Request, limit: int = 100):
 
 @app.get("/admin/session/{conv_id}")
 async def admin_session(conv_id: str, request: Request):
-    if (denied := _check_auth(request)) is not None:
+    if (denied := _check_auth(request, admin=True)) is not None:
         return denied
     st = store.get()
     matched = await st.match_prefix(conv_id)
@@ -186,7 +233,7 @@ async def _resolve_conv(conv_id: str):
 @app.get("/admin/session/{conv_id}/summary")
 async def get_summary(conv_id: str, request: Request, format: str = "json"):
     """取当前生效的累积摘要全文。format=text 时直接返回纯文本，便于重定向到文件编辑。"""
-    if (denied := _check_auth(request)) is not None:
+    if (denied := _check_auth(request, admin=True)) is not None:
         return denied
     cid, _conv, err = await _resolve_conv(conv_id)
     if err is not None:
@@ -197,7 +244,6 @@ async def get_summary(conv_id: str, request: Request, format: str = "json"):
         return JSONResponse(status_code=404, content={
             "error": {"message": "这个会话还没有任何 checkpoint（尚未触发过压缩）"}})
     if format == "text":
-        from fastapi.responses import PlainTextResponse
         return PlainTextResponse(ck["summary"] or "")
     open_ev = await st.open_event_checkpoint(cid)
     return {
@@ -222,7 +268,7 @@ async def put_summary(conv_id: str, request: Request):
     base_seq 是乐观锁：取回摘要之后如果又发生过压缩，seq 会变，这里直接拒绝，
     避免把模型刚压出来的新内容覆盖掉。
     """
-    if (denied := _check_auth(request)) is not None:
+    if (denied := _check_auth(request, admin=True)) is not None:
         return denied
     payload = await request.json()
     text = payload.get("summary")
@@ -273,7 +319,7 @@ async def put_summary(conv_id: str, request: Request):
 
 @app.post("/admin/clean")
 async def admin_clean(request: Request):
-    if (denied := _check_auth(request)) is not None:
+    if (denied := _check_auth(request, admin=True)) is not None:
         return denied
     body = await request.json()
     target = (body.get("target") or "").strip()
@@ -286,6 +332,16 @@ async def admin_clean(request: Request):
     await st.delete(ids)
     log.info("已清除 %d 个会话（target=%r）", len(ids), target)
     return {"status": "cleaned", "removed_count": len(ids), "removed": [c[:16] for c in ids]}
+
+
+@app.get("/ui")
+async def ui_page():
+    """可视化页面。ui_token 没配就整个不存在，避免无意中把后台裸奔在公网上。"""
+    if not config.ui_token():
+        return JSONResponse(status_code=404, content={"error": {"message":
+            "可视化页面未启用：在 config.yaml 的 server.ui_token 里设一个密钥"
+            "（./ctl.sh ui-token 可生成），然后 ./ctl.sh reload"}})
+    return HTMLResponse(ui.PAGE)
 
 
 # ===== 转发 =====
