@@ -460,9 +460,12 @@ def test_recompress_writes_new_checkpoint_and_keeps_history():
     kinds = [c["kind"] for c in detail["checkpoints"]]
     assert "recompress" in kinds, kinds
     assert any(c["pinned"] for c in detail["checkpoints"]), "最早的 checkpoint 必须永久保留"
-    # 二次重压走的是 merge 提示词，不会产生多份同名章节（全文从 /summary 取）
+    # 二次重压和批次摘要同构：按阈值分批 + 系统拼接，没有额外的"合并成稿"调用
+    recompress_calls = [c for c in summary_calls() if "需要精简的摘要内容" in c["prompt"]]
+    assert recompress_calls, "应当调过二次重压"
+    assert not any("合并" in c["prompt"] for c in summary_calls()), "不该再有单独的合并调用"
     merged = _summary_api(sessions()[0]["conv_id"]).json()["summary"]
-    assert merged.count("## 用户背景与偏好") <= 1
+    assert merged and len(merged) < 4000
 
 
 def test_checkpoint_window_keeps_earliest_and_recent():
@@ -957,3 +960,89 @@ def test_ui_summary_edit_flow_through_admin_api():
     r = httpx.put(f"{PROXY}/admin/session/{cid}/summary", headers=ui_h, timeout=5,
                   json={"summary": "## 关键事实\n页面改的", "base_seq": got["base_seq"]})
     assert r.status_code == 200 and r.json()["new_seq"] == got["base_seq"] + 1
+
+
+# ---- 提示词读写 ----
+
+def test_prompt_edit_takes_effect_and_can_be_reset():
+    fresh(ui_token=UI_TOKEN)
+    got = httpx.get(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5).json()["prompts"]
+    names = {p["name"] for p in got}
+    assert names == {"batch_system", "recompress", "injection", "fallback_notice"}
+    assert all(p["overridden"] is False for p in got)
+
+    mark = "【这是页面上改的批次摘要提示词】"
+    r = httpx.put(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5,
+                  json={"prompts": {"batch_system": mark + "请压缩下面的对话。"}})
+    assert r.status_code == 200 and r.json()["overridden"] == ["batch_system"]
+
+    # 下一次压缩就用改过的提示词
+    assert post("mm", convo(30)).status_code == 200
+    assert any(mark in c.get("system_preview", "") for c in summary_calls()), \
+        [c.get("system_preview") for c in summary_calls()][:2]
+
+    # 覆盖项跨热重载存活（存在 DB 里，不回写 config.yaml）
+    app_module.do_reload()
+    after = {p["name"]: p for p in
+             httpx.get(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5).json()["prompts"]}
+    assert after["batch_system"]["overridden"] is True
+    assert mark in after["batch_system"]["effective"]
+    assert mark not in after["batch_system"]["from_file"], "config.yaml 不该被回写"
+
+    # 提交空字符串 = 恢复文件里的值
+    httpx.put(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5,
+              json={"prompts": {"batch_system": ""}})
+    back = {p["name"]: p for p in
+            httpx.get(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5).json()["prompts"]}
+    assert back["batch_system"]["overridden"] is False
+
+
+def test_injection_prompt_must_keep_placeholder():
+    fresh(ui_token=UI_TOKEN)
+    r = httpx.put(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5,
+                  json={"prompts": {"injection": "忘了写占位符"}})
+    assert r.status_code == 400 and "{summary}" in r.json()["error"]["message"]
+    r = httpx.put(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5,
+                  json={"prompts": {"不存在的提示词": "x"}})
+    assert r.status_code == 400
+
+
+# ---- 时间轴 ----
+
+def test_timeline_disabled_by_default():
+    fresh()
+    assert post("mm", convo(30)).status_code == 200
+    r = httpx.get(f"{PROXY}/admin/session/{sessions()[0]['conv_id']}/timeline",
+                  headers=HEADERS, timeout=5)
+    assert r.status_code == 404 and "capture_timeline" in r.json()["error"]["message"]
+
+
+def test_timeline_marks_folded_rounds():
+    _counter["n"] += 1
+    write_config(f"db/tl{_counter['n']}.db", ui_token=UI_TOKEN)
+    cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    cfg["observability"] = {"capture_timeline": True, "preview_chars": 40}
+    CFG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    app_module.do_reload()
+    httpx.post(f"{MOCK}/__reset", timeout=5)
+
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    tl = httpx.get(f"{PROXY}/admin/session/{cid}/timeline", headers=HEADERS, timeout=5).json()
+
+    assert tl["total_rounds"] == 30 and len(tl["rounds"]) == 30
+    assert tl["in"]["messages"] == 60 and tl["out"]["messages"] < 60
+    assert tl["out"]["tokens"] < tl["in"]["tokens"], "发出去的应当远小于进来的"
+
+    folded = [r for r in tl["rounds"] if r["c"]]
+    kept = [r for r in tl["rounds"] if not r["c"]]
+    assert folded and kept, "应当既有被折叠的轮次也有逐字保留的"
+    assert max(r["r"] for r in folded) < min(r["r"] for r in kept), "折叠的必须都在前面"
+    assert all(len(r["p"]) <= 40 for r in tl["rounds"]), "预览按 preview_chars 截断"
+    assert all("【第" in r["p"] for r in tl["rounds"])
+
+    # 只留最新一份：再发一次请求会覆盖，不会越堆越多
+    before = tl["at"]
+    assert post("mm", convo(30) + convo(1, start=99, head=False)).status_code == 200
+    tl2 = httpx.get(f"{PROXY}/admin/session/{cid}/timeline", headers=HEADERS, timeout=5).json()
+    assert tl2["at"] > before and tl2["total_rounds"] == 31

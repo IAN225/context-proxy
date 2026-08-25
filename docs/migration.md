@@ -76,7 +76,9 @@ curl -s localhost:8787/health | python3 -m json.tool
 | 变化 | 说明 |
 |---|---|
 | `summary.system_prompt` → `summary.prompts.batch_system` | 内容可以直接搬过来 |
-| 新增 `summary.prompts.recompress_chunk` / `recompress_merge` | 二次重压的两段式提示词 |
+| 新增 `summary.prompts.recompress` | 二次重压提示词。**旧的 `recompress_chunk` / `recompress_merge` 已合并成这一条**：旧配置里如果有 `recompress_chunk`，会自动当作 `recompress` 沿用，两个旧键被忽略，不会报错 |
+| 新增 `observability.capture_timeline` / `preview_chars` | 请求快照，供 `/ui` 画时间轴。默认关闭 |
+| 新增 `server.ui_token` | 可视化页面的登录密钥，留空则页面不启用 |
 | 新增 `summary.prompts.injection` | 注入给主模型的包装语，`{summary}` 是占位符 |
 | 新增 `summary.prompts.fallback_notice` | 定位兜底时追加的警告语 |
 | 新增 `summary.fallback.*` | 备用摘要模型 |

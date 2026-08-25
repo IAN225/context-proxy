@@ -48,6 +48,7 @@ def bootstrap() -> None:
     logging_setup.setup()
     logging_setup.install_crash_handlers()
     store.init(config.db_path())
+    _load_prompt_overrides()
     log.info("配置已加载：providers=%s summary=%s fallback=%s",
              list(config.providers()), config.summary().get("model"),
              (config.summary().get("fallback") or {}).get("model")
@@ -58,8 +59,29 @@ def do_reload() -> dict[str, Any]:
     summary = config.reload(warn=log.warning)
     logging_setup.setup()
     store.init(config.db_path())
+    _load_prompt_overrides()
     log.info("配置已热重载：%s", summary)
     return summary
+
+
+PROMPT_OVERRIDE_KEY = "prompt_overrides"
+
+
+def _load_prompt_overrides() -> None:
+    """页面上改过的提示词存在 DB 里，热重载后要重新盖回去，否则会被文件里的值顶掉。"""
+    st = store.get()
+    if not st.enabled:
+        config.set_prompt_overrides({})
+        return
+    try:
+        raw = st._get_meta_sync(PROMPT_OVERRIDE_KEY)      # 启动路径，同步读一次即可
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        log.exception("提示词覆盖项读取失败，改用 config.yaml 里的值")
+        data = {}
+    config.set_prompt_overrides(data)
+    if data:
+        log.info("已装载页面保存的提示词覆盖项：%s", ", ".join(sorted(data)))
 
 
 # ===== 鉴权 =====
@@ -134,6 +156,18 @@ def _chunk(model: str, *, content: str | None = None, reasoning: str | None = No
     return {"id": "chatcmpl-proxy", "object": "chat.completion.chunk",
             "created": int(time.time()), "model": model,
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+
+
+async def _save_timeline(prepared) -> None:
+    tl = (prepared.meta or {}).pop("_timeline", None)
+    (prepared.meta or {}).pop("_final_roles", None)
+    if not tl:
+        return
+    try:
+        await store.get().save_timeline(prepared.meta["conv_id"],
+                                        json.dumps(tl, ensure_ascii=False))
+    except Exception:
+        log.exception("请求快照落盘失败（不影响本次转发）")
 
 
 def _refusal_payload(exc: compress.CompressionRefused) -> dict:
@@ -317,6 +351,77 @@ async def put_summary(conv_id: str, request: Request):
             "note": "下一次请求即生效；后续压缩会在此基础上追加"}
 
 
+PROMPT_LABELS = {
+    "batch_system": "批次摘要：把一段原文对话压成要点",
+    "recompress": "二次重压：累积摘要超过 cap 时逐片精简（按阈值分批，系统拼接）",
+    "injection": "注入给主模型的包装语（{summary} 是占位符，必须保留）",
+    "fallback_notice": "定位兜底时追加的警告语",
+}
+
+
+@app.get("/admin/prompts")
+async def get_prompts(request: Request):
+    if (denied := _check_auth(request, admin=True)) is not None:
+        return denied
+    src = config.prompt_sources()
+    return {"prompts": [{"name": k, "label": PROMPT_LABELS.get(k, k), **v}
+                        for k, v in src.items()]}
+
+
+@app.put("/admin/prompts")
+async def put_prompts(request: Request):
+    """保存提示词。写进数据库当覆盖项，不回写 config.yaml（那会把注释冲掉）。
+
+    某条提交空字符串 = 删除该条覆盖，恢复成 config.yaml 里的值。
+    """
+    if (denied := _check_auth(request, admin=True)) is not None:
+        return denied
+    payload = await request.json()
+    incoming = payload.get("prompts")
+    if not isinstance(incoming, dict):
+        return JSONResponse(status_code=400, content={
+            "error": {"message": "body 需要 {\"prompts\": {name: text}}"}})
+
+    current = config.prompt_overrides()
+    file_vals = config.cfg()["summary"]["prompts"]
+    for name, text in incoming.items():
+        if name not in config.FALLBACK_PROMPTS:
+            return JSONResponse(status_code=400, content={
+                "error": {"message": f"未知的提示词 {name!r}，可用：{list(config.FALLBACK_PROMPTS)}"}})
+        text = text if isinstance(text, str) else ""
+        if not text.strip() or text.strip() == (file_vals.get(name) or "").strip():
+            current.pop(name, None)              # 和文件里一样就没必要留覆盖
+            continue
+        if name == "injection" and "{summary}" not in text:
+            return JSONResponse(status_code=400, content={"error": {"message":
+                "injection 里必须保留 {summary} 占位符，否则摘要不会被注入"}})
+        current[name] = text
+
+    st = store.get()
+    if st.enabled:
+        await st.set_meta(PROMPT_OVERRIDE_KEY, json.dumps(current, ensure_ascii=False))
+    config.set_prompt_overrides(current)
+    log.warning("提示词已更新：覆盖项 = %s（未回写 config.yaml）",
+                ", ".join(sorted(current)) or "无（全部恢复为文件值）")
+    return {"status": "saved", "overridden": sorted(current)}
+
+
+@app.get("/admin/session/{conv_id}/timeline")
+async def get_timeline(conv_id: str, request: Request):
+    if (denied := _check_auth(request, admin=True)) is not None:
+        return denied
+    cid, _conv, err = await _resolve_conv(conv_id)
+    if err is not None:
+        return err
+    tl = await store.get().load_timeline(cid)
+    if tl is None:
+        return JSONResponse(status_code=404, content={"error": {"message":
+            "还没有快照。把 config.yaml 的 observability.capture_timeline 设为 true 并 reload，"
+            "然后这个会话再发一次消息就有了。" if not config.observability().get("capture_timeline")
+            else "这个会话在开启快照后还没有新的请求。"}})
+    return tl
+
+
 @app.post("/admin/clean")
 async def admin_clean(request: Request):
     if (denied := _check_auth(request, admin=True)) is not None:
@@ -379,6 +484,7 @@ async def _non_stream(url: str, headers: dict, body: dict, messages: list[dict],
             "message": f"上下文压缩失败，已拦截本次请求以避免按全量 token 计费：{type(e).__name__}: {e}",
             "type": "context_compression_error"}})
 
+    await _save_timeline(prepared)
     body = {**body, "messages": prepared.messages}
     try:
         async with httpx.AsyncClient(timeout=up["timeout_seconds"]) as client:
@@ -447,6 +553,7 @@ async def _stream(url: str, headers: dict, body: dict, messages: list[dict],
             yield b"data: [DONE]\n\n"
             return
 
+        await _save_timeline(prepared)
         out_body = {**body, "messages": prepared.messages}
         async for piece in _forward_stream(url, headers, out_body, stream_timeout,
                                            provider, model_name):

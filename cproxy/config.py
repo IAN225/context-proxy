@@ -20,6 +20,8 @@ _LOCK = threading.RLock()
 _CONFIG: dict[str, Any] = {}
 _PROVIDERS: dict[str, dict[str, Any]] = {}
 _SECRETS: dict[str, str | None] = {}
+# 页面上保存的提示词覆盖项（来源是数据库，不是 config.yaml）
+_OVERRIDES: dict[str, str] = {}
 
 DEFAULTS: dict[str, Any] = {
     "summary": {
@@ -39,6 +41,7 @@ DEFAULTS: dict[str, Any] = {
         "main_max_attempts": 2,
         "min_output_tokens": 50,
     },
+    "observability": {"capture_timeline": False, "preview_chars": 60},
     "stream": {"smooth_chars": 24, "smooth_delay": 0.008, "flush_backlog_chars": 600},
     "tokenizer": {"encoding": "cl100k_base", "per_message_overhead": 12, "image_tokens": 1100},
     "server": {"host": "0.0.0.0", "port": 8787},
@@ -48,8 +51,7 @@ DEFAULTS: dict[str, Any] = {
 
 FALLBACK_PROMPTS: dict[str, str] = {
     "batch_system": "你是一个对话历史压缩器，请把给到的对话片段压缩成不丢关键信息的结构化要点，禁止编造。",
-    "recompress_chunk": "下面是一份长摘要的一个片段，请只做压缩去冗余，严禁输出任何章节标题。",
-    "recompress_merge": "请把下列摘要材料合并去重，输出唯一一套章节结构的最终摘要，禁止重复章节。",
+    "recompress": "请对下面的摘要做无损精简：删冗余、并同类，保留全部事实与具体值，禁止编造。",
     "injection": "以下是本次对话更早部分的摘要，请当作你自己的记忆继续对话：\n\n{summary}",
     "fallback_notice": "\n\n【重要】用户可能从较早的消息处创建了分支，摘要与后续原文衔接处可能重叠或跳跃，冲突以原文为准。",
 }
@@ -87,9 +89,14 @@ def _merge_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
             node.setdefault(k, v)
         out[section] = node
     prompts = out["summary"].setdefault("prompts", {}) or {}
+    # 兼容旧配置：二次重压从"分片 + 合并"两套提示词合并成了一套
+    if "recompress" not in prompts and prompts.get("recompress_chunk"):
+        prompts["recompress"] = prompts["recompress_chunk"]
+    for k in ("recompress_chunk", "recompress_merge"):
+        prompts.pop(k, None)
     for k, v in FALLBACK_PROMPTS.items():
         prompts.setdefault(k, v)
-    out["summary"]["prompts"] = prompts
+    out["summary"]["prompts"] = {k: v for k, v in prompts.items() if k in FALLBACK_PROMPTS}
     fb = out["summary"].get("fallback")
     if not isinstance(fb, dict):
         fb = {}
@@ -182,7 +189,38 @@ def keep_recent_tokens() -> int:
 
 
 def prompts() -> dict[str, str]:
-    return _CONFIG["summary"]["prompts"]
+    """生效的提示词 = config.yaml 的值，被页面上保存的覆盖项盖住。
+
+    覆盖项存在数据库里而不是回写 config.yaml——回写会把文件里的注释和排版冲掉，
+    而这份配置的注释本身就是文档。想恢复成文件里的值，删掉覆盖项即可。
+    """
+    base = dict(_CONFIG["summary"]["prompts"])
+    base.update({k: v for k, v in _OVERRIDES.items() if k in FALLBACK_PROMPTS and v})
+    return base
+
+
+def prompt_sources() -> dict[str, dict[str, Any]]:
+    """给页面用：每条提示词的文件值、覆盖值、当前生效值。"""
+    file_vals = _CONFIG["summary"]["prompts"]
+    return {k: {"effective": _OVERRIDES.get(k) or file_vals.get(k, FALLBACK_PROMPTS[k]),
+                "from_file": file_vals.get(k, FALLBACK_PROMPTS[k]),
+                "overridden": bool(_OVERRIDES.get(k))}
+            for k in FALLBACK_PROMPTS}
+
+
+def set_prompt_overrides(overrides: dict[str, str]) -> None:
+    with _LOCK:
+        _OVERRIDES.clear()
+        _OVERRIDES.update({k: v for k, v in (overrides or {}).items()
+                           if k in FALLBACK_PROMPTS and isinstance(v, str) and v.strip()})
+
+
+def prompt_overrides() -> dict[str, str]:
+    return dict(_OVERRIDES)
+
+
+def observability() -> dict[str, Any]:
+    return _CONFIG["observability"]
 
 
 def stream_cfg() -> dict[str, Any]:

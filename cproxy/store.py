@@ -69,6 +69,14 @@ CREATE TABLE IF NOT EXISTS fp_index (
 CREATE INDEX IF NOT EXISTS idx_fp_conv ON fp_index(conv_id);
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+
+-- 每个会话只留**最新一份**请求快照（覆盖写），供页面画时间轴。
+-- 只存结构与预览，不存原文；默认不开，见 observability.capture_timeline。
+CREATE TABLE IF NOT EXISTS timelines (
+    conv_id    TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL,
+    updated_at REAL NOT NULL
+) WITHOUT ROWID;
 """
 
 
@@ -274,6 +282,25 @@ class Store:
                 self._conn.rollback()
                 raise
 
+    def _get_meta_sync(self, k: str) -> str | None:
+        rows = self._q("SELECT v FROM meta WHERE k = ?", (k,))
+        return rows[0]["v"] if rows else None
+
+    def _set_meta_sync(self, k: str, v: str) -> None:
+        self._x("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)", (k, v))
+
+    def _save_timeline_sync(self, conv_id: str, payload: str) -> None:
+        self._x("INSERT OR REPLACE INTO timelines (conv_id, payload, updated_at) VALUES (?,?,?)",
+                (conv_id, payload, time.time()))
+
+    def _load_timeline_sync(self, conv_id: str) -> dict | None:
+        rows = self._q("SELECT payload, updated_at FROM timelines WHERE conv_id = ?", (conv_id,))
+        if not rows:
+            return None
+        d = json.loads(rows[0]["payload"])
+        d["updated_at"] = rows[0]["updated_at"]
+        return d
+
     def _prune(self, conv_id: str, keep: int) -> None:
         """保留：置顶的最早一条 + 最近 keep 个压缩事件（按事件计，不按批次）。调用方负责事务。"""
         assert self._conn is not None
@@ -379,6 +406,7 @@ class Store:
                 for cid in conv_ids:
                     self._conn.execute("DELETE FROM checkpoints WHERE conv_id = ?", (cid,))
                     self._conn.execute("DELETE FROM fp_index WHERE conv_id = ?", (cid,))
+                    self._conn.execute("DELETE FROM timelines WHERE conv_id = ?", (cid,))
                     self._conn.execute("DELETE FROM conversations WHERE conv_id = ?", (cid,))
                 self._conn.commit()
             except Exception:
@@ -497,6 +525,18 @@ class Store:
 
     async def bump_fallback(self, conv_id: str) -> int:
         return await self._call(self._bump_fallback_sync, conv_id) or 0
+
+    async def get_meta(self, k: str) -> str | None:
+        return await self._call(self._get_meta_sync, k)
+
+    async def set_meta(self, k: str, v: str) -> None:
+        await self._call(self._set_meta_sync, k, v)
+
+    async def save_timeline(self, conv_id: str, payload: str) -> None:
+        await self._call(self._save_timeline_sync, conv_id, payload)
+
+    async def load_timeline(self, conv_id: str) -> dict | None:
+        return await self._call(self._load_timeline_sync, conv_id)
 
     async def stats(self) -> dict:
         return await self._call(self._stats_sync) or {}
