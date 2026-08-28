@@ -77,6 +77,12 @@ async def chat(request: Request):
         # 摘要请求的 user prompt（里面是被渲染成文本的那一批原文）
         "prompt": str(msgs[-1].get("content", ""))[:4000] if msgs else "",
         "stream": bool(body.get("stream")),
+        "extra": {k: v for k, v in body.items()
+                  if k not in ("model", "messages", "stream", "max_tokens")},
+        "headers": {k: v for k, v in request.headers.items()
+                    if k.lower() not in ("host", "content-length", "accept-encoding",
+                                         "connection", "user-agent", "accept", "content-type")},
+        "query": str(request.url.query),
     })
 
     if _is_summary(body):

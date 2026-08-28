@@ -75,6 +75,44 @@ chmod +x ctl.sh && ./ctl.sh start     # 本地调试用；长期运行请用下�
 `<provider>` 换成 `config.yaml` 里配的任意 `name`。每个供应商一个独立 URL，
 保存后 chatbox 会自动从 `/<provider>/v1/models` 拉到模型列表。
 
+### 参数怎么传给上游
+
+`messages` 之外的 body 字段**一律原样透传**——`temperature`、`top_p`、`seed`、`tools`、
+`response_format`、各家的思考开关，以及任何厂商私有字段，代理都不认识也不改动，
+所以将来出现的新参数自动就支持。
+
+想强制某个 chatbox 界面上表达不了的参数（比如思考强度），用 `extra_body`：
+
+```yaml
+providers:
+  - name: <provider>
+    extra_body:                    # 会覆盖客户端发来的同名字段
+      reasoning_effort: "xhigh"
+
+summary:
+  extra_body:                      # 摘要模型通常配得正好相反：不思考、低温
+    temperature: 0.5
+    enable_thinking: false
+```
+
+> ⚠️ 思考开关的字段名各家不同（`reasoning_effort` / `thinking` / `enable_thinking` …），
+> 写了上游不认识的字段有些网关会直接 400。config.yaml 里几种写法都列了并注释掉，
+> **只留你的供应商确实支持的那一行**，改完先发一条消息验证。
+> `messages` 和 `stream` 不接受改写（改了等于绕过压缩、破坏流式处理），写了会被忽略并告警。
+
+请求头默认**不透传**（无脑转发会把 cookie、`x-forwarded-for` 一起漏给上游），
+需要哪个按名字白名单放行；查询串同理：
+
+```yaml
+providers:
+  - name: <provider>
+    forward_headers: ["anthropic-beta", "http-referer", "x-title"]
+    forward_query: true            # Azure OpenAI 的 ?api-version= 需要
+```
+
+`Authorization` 永远由代理换成该 provider 的 `api_key`（客户端发来的是代理的 token），
+写进白名单也不会生效。
+
 ---
 
 ## 长期运行：systemd

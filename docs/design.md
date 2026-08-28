@@ -290,6 +290,34 @@ COMMIT;
 
 ---
 
+## 3.8 上游参数怎么过
+
+**`messages` 之外一律不碰。** 转发就一句 `{**body, **extra_body, "messages": prepared.messages}`，
+所以 `temperature` / `top_p` / `seed` / `tools` / `response_format` / 各家思考开关 /
+厂商私有字段全都原样过去，将来出现的新参数也自动支持——不维护白名单，就不会漏。
+
+三个配置项补上代理必须介入的部分：
+
+| 配置 | 为什么需要 |
+|---|---|
+| `providers[].extra_body` | 强制客户端界面表达不了的参数（思考强度等）。**覆盖**客户端同名字段——这个配置的用途就是"我说了算"。`messages` / `stream` 在加载配置时就被剔除，改它们等于绕过压缩、破坏流式处理 |
+| `providers[].forward_headers` | 请求头默认不透传。无脑转发会把 `cookie`、`x-forwarded-for` 一起漏给上游，所以按名字白名单放行。`authorization` / `host` / `content-length` 等永远拒绝——鉴权头必须换成供应商的 key，传输层的头由 httpx 重算 |
+| `providers[].forward_query` | 查询串默认不透传；Azure OpenAI 的 `?api-version=` 需要它 |
+
+摘要模型侧对应 `summary.extra_body`（`summary.fallback.extra_body` 不写就沿用主模型的）。
+在 `summarizer._one_call` 里 extra_body 先铺底、再让 `model` / `max_tokens` / `messages` /
+`stream` 覆盖它——那四个是这条调用链的骨架，不接受改写。
+
+### 流式平滑会重写正文分片的元数据
+
+`stream.smooth_chars > 0` 时，被切片的正文 chunk 由代理重新打包，`id` 变成
+`chatcmpl-proxy`、`system_fingerprint` 在这些分片上丢失（`reasoning_content` /
+`finish_reason` / `usage` 都保留，正文能完整拼回）。**设 `smooth_chars: 0` 就是逐字节
+原样透传**，也是最快的——平滑本来就是那个 `peer closed connection` 的元凶，
+没有特别理由建议关掉。
+
+---
+
 ## 4. 并发与性能
 
 服务器是 2 核 4G 的轻量云主机，还要跑 1panel + 一个 chatbox + 一个 CPU-only 的 ollama，

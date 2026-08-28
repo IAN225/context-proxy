@@ -16,6 +16,22 @@ providers:
     connect_timeout_seconds: 30
     multimodal: true                           # false = 转发前剥掉历史里的图片，只留 [图片] 占位
 
+    # 强制附加到每个请求上的参数，**会覆盖客户端发来的同名字段**。
+    # 用途是设置 chatbox 界面上表达不了的参数（比如思考强度）。
+    # messages / stream 不接受改写（改了等于绕过压缩、破坏流式处理），写了会被忽略并告警。
+    # ⚠️ 字段名各家不一样，而且写了上游不认识的字段有些网关会直接 400。
+    #    只保留你的供应商确实支持的那一行，其余删掉，改完先发一条消息验证。
+    extra_body:
+      reasoning_effort: "xhigh"                # 思考强度拉满（OpenAI o 系 / 部分网关：minimal|low|medium|high|xhigh）
+      # thinking: {type: "enabled", budget_tokens: 8000}   # Anthropic 系写法
+      # enable_thinking: true                              # Qwen / DeepSeek 系写法
+      # temperature: 1.0
+
+    # 客户端请求头默认**不透传**（无脑转发会把 cookie、x-forwarded-for 一起漏给上游）。
+    # 需要哪个就在这里按名字白名单放行；Authorization 永远由代理换成上面的 api_key。
+    forward_headers: []                        # 例：["anthropic-beta", "http-referer", "x-title"]
+    forward_query: false                       # true = 把 ?xxx=yyy 查询串带给上游（Azure 的 api-version 需要）
+
   # 纯文本供应商示例：不支持图片的模型必须设 multimodal: false，否则带图历史会报错
   - name: provider-b
     base_url: ""
@@ -63,6 +79,16 @@ summary:
   main_max_attempts: 2                         # 主模型可重试次数（仅对超时/5xx/429 生效）
   min_output_tokens: 50                        # 输出（不含思考部分）低于此 token 数判定为失败
 
+  # 摘要模型的附加参数。摘要是"照着原文复述要点"，思考没什么用还慢又贵，
+  # 温度低一点更稳，所以这里通常和主模型配得正好相反。
+  # 同样：字段名各家不同，只留你的供应商认识的那一行，其余删掉。
+  extra_body:
+    temperature: 0.5
+    # reasoning_effort: "minimal"              # OpenAI o 系：能给的最低档（部分网关支持 "none"）
+    # thinking: {type: "disabled"}             # Anthropic 系：关闭思考
+    # enable_thinking: false                   # Qwen / DeepSeek 系：关闭思考
+    # top_p: 0.9
+
   # --- 摘要模型（备）：主模型失败后切到这里 ---
   fallback:
     enabled: false
@@ -70,6 +96,8 @@ summary:
     api_key: ""                                # 环境变量 SUMMARY_FALLBACK_API_KEY 优先
     model: ""
     max_attempts: 3                            # 备用模型最多重试 3 次，仍失败则报错结束
+    # extra_body:                              # 不写就沿用上面主摘要模型的 extra_body
+    #   temperature: 0.5
 
   # --- 提示词（页面上也能改，见 /ui）---
   prompts:

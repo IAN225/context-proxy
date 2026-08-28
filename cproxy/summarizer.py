@@ -76,7 +76,10 @@ def _extract_text(data: dict) -> tuple[str, str]:
 
 async def _one_call(ep: dict[str, Any], system_prompt: str, user_prompt: str,
                     max_tokens: int, timeout_s: float) -> str:
+    # extra_body 先铺底，再让本函数的固定字段覆盖它——
+    # model / max_tokens 由摘要配置决定，messages / stream 是这条调用链的骨架，都不接受改写。
     payload = {
+        **(ep.get("extra_body") or {}),
         "model": ep["model"],
         "max_tokens": max_tokens,
         "stream": False,

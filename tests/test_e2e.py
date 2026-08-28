@@ -1046,3 +1046,92 @@ def test_timeline_marks_folded_rounds():
     assert post("mm", convo(30) + convo(1, start=99, head=False)).status_code == 200
     tl2 = httpx.get(f"{PROXY}/admin/session/{cid}/timeline", headers=HEADERS, timeout=5).json()
     assert tl2["at"] > before and tl2["total_rounds"] == 31
+
+
+# ---- body / header / query 透传与 extra_body ----
+
+def test_body_params_pass_through_untouched():
+    """messages 之外的字段一律原样透传，包括厂商私有字段。"""
+    fresh()
+    extras = {"temperature": 0.7, "top_p": 0.9, "seed": 42, "stop": ["\n\n"],
+              "reasoning_effort": "xhigh", "thinking": {"type": "enabled", "budget_tokens": 8000},
+              "enable_thinking": True, "thinking_budget": 4096,
+              "tools": [{"type": "function", "function": {"name": "f"}}], "tool_choice": "auto",
+              "response_format": {"type": "json_object"}, "user": "u-1",
+              "厂商私有字段": "保留我"}
+    assert post("mm", convo(2), **extras).status_code == 200
+    got = chat_calls()[-1]["extra"]
+    for k, v in extras.items():
+        assert got.get(k) == v, f"{k} 没原样透传: {got.get(k)!r} != {v!r}"
+
+
+def test_extra_body_overrides_client_and_protects_core_fields():
+    fresh()
+    cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    cfg["providers"] = [
+        {"name": "mm", "base_url": f"{MOCK}/v1", "api_key": "sk-up", "multimodal": True,
+         "extra_body": {"reasoning_effort": "xhigh", "temperature": 1.0,
+                        "messages": [{"role": "user", "content": "偷天换日"}], "stream": True}},
+        {"name": "text", "base_url": f"{MOCK}/v1", "api_key": "sk-up", "multimodal": False},
+    ]
+    CFG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    app_module.do_reload()
+
+    assert post("mm", convo(3), temperature=0.2, reasoning_effort="low").status_code == 200
+    c = chat_calls()[-1]
+    assert c["extra"]["reasoning_effort"] == "xhigh", "extra_body 应当覆盖客户端的 low"
+    assert c["extra"]["temperature"] == 1.0
+    # messages / stream 被保护：既没被换掉，也没被强行改成流式
+    assert c["n_messages"] == len(convo(3)) and c["stream"] is False
+    assert "偷天换日" not in json.dumps(c, ensure_ascii=False)
+
+
+def test_summary_model_extra_body_applies():
+    fresh(extra_body={"temperature": 0.5, "enable_thinking": False})
+    assert post("mm", convo(30)).status_code == 200
+    s = summary_calls()[0]
+    assert s["extra"]["temperature"] == 0.5
+    assert s["extra"]["enable_thinking"] is False
+    # 骨架字段不受影响
+    assert s["n_messages"] == 2 and s["stream"] is False
+
+
+def test_headers_are_not_forwarded_unless_whitelisted():
+    fresh()
+    h = {**HEADERS, "anthropic-beta": "interleaved-thinking", "X-Title": "my-app",
+         "Cookie": "secret=1", "X-Forwarded-For": "10.0.0.9"}
+    httpx.post(f"{PROXY}/mm/v1/chat/completions", headers=h, timeout=30,
+               json={"model": "mock-chat", "messages": convo(2)})
+    got = {k.lower(): v for k, v in chat_calls()[-1]["headers"].items()}
+    assert "anthropic-beta" not in got and "x-title" not in got, "默认不该透传"
+    assert got.get("authorization") == "Bearer sk-up", "鉴权头必须换成供应商的 key"
+
+    cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    cfg["providers"][0]["forward_headers"] = ["anthropic-beta", "x-title",
+                                              "authorization", "cookie"]   # 后两个应被拒
+    CFG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    app_module.do_reload()
+
+    httpx.post(f"{PROXY}/mm/v1/chat/completions", headers=h, timeout=30,
+               json={"model": "mock-chat", "messages": convo(2)})
+    got = {k.lower(): v for k, v in chat_calls()[-1]["headers"].items()}
+    assert got.get("anthropic-beta") == "interleaved-thinking"
+    assert got.get("x-title") == "my-app"
+    assert got.get("authorization") == "Bearer sk-up", "白名单里写 authorization 也不能生效"
+    assert "cookie" not in got, "cookie 永远不透传"
+    assert "x-forwarded-for" not in got
+
+
+def test_query_string_forwarding_is_opt_in():
+    fresh()
+    httpx.post(f"{PROXY}/mm/v1/chat/completions?api-version=2024-08-01", headers=HEADERS,
+               timeout=30, json={"model": "mock-chat", "messages": convo(2)})
+    assert chat_calls()[-1]["query"] == "", "默认不透传查询串"
+
+    cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    cfg["providers"][0]["forward_query"] = True
+    CFG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    app_module.do_reload()
+    httpx.post(f"{PROXY}/mm/v1/chat/completions?api-version=2024-08-01", headers=HEADERS,
+               timeout=30, json={"model": "mock-chat", "messages": convo(2)})
+    assert chat_calls()[-1]["query"] == "api-version=2024-08-01"

@@ -462,13 +462,53 @@ async def chat_completions(provider: str, request: Request):
 
     body = await request.json()
     messages = body.get("messages") or []
-    url = f"{up['base_url'].rstrip('/')}/chat/completions"
-    headers = {"Authorization": f"Bearer {up['api_key']}", "Content-Type": "application/json"}
+    url = _upstream_url(up, request)
+    headers = _upstream_headers(up, request)
+    body = _apply_extra_body(body, up, provider)
     model_name = body.get("model", "")
 
     if not bool(body.get("stream", False)):
         return await _non_stream(url, headers, body, messages, up, provider)
     return await _stream(url, headers, body, messages, up, provider, model_name)
+
+
+def _upstream_url(up: dict, request: Request) -> str:
+    """拼上游 URL。开了 forward_query 就把客户端的查询串带过去（Azure 的 api-version 等）。"""
+    url = f"{up['base_url'].rstrip('/')}/chat/completions"
+    q = request.url.query
+    if up.get("forward_query") and q:
+        url = f"{url}{'&' if '?' in url else '?'}{q}"
+    return url
+
+
+def _upstream_headers(up: dict, request: Request) -> dict[str, str]:
+    """鉴权头必须换成供应商的 key（客户端发来的是代理的 token）。
+
+    其余头默认**不透传**——无脑转发会把 cookie、x-forwarded-for 之类一起漏给上游。
+    需要哪个就在 providers[].forward_headers 里按名字白名单放行。
+    """
+    headers = {"Authorization": f"Bearer {up['api_key']}", "Content-Type": "application/json"}
+    for name in up.get("forward_headers") or []:
+        v = request.headers.get(name)
+        if v:
+            headers[name] = v
+    return headers
+
+
+def _apply_extra_body(body: dict, up: dict, provider: str) -> dict:
+    """把 providers[].extra_body 合进请求体。
+
+    **覆盖客户端的同名字段**——这个配置的用途就是强制某个客户端界面上表达不了的参数
+    （比如思考强度）。messages / stream 在加载配置时就被挡掉了，这里不会被改。
+    """
+    extra = up.get("extra_body") or {}
+    if not extra:
+        return body
+    overridden = [k for k in extra if k in body and body[k] != extra[k]]
+    if overridden:
+        log.info("[%s] extra_body 覆盖了客户端参数：%s", provider,
+                 ", ".join(f"{k}={body[k]!r}→{extra[k]!r}" for k in overridden))
+    return {**body, **extra}
 
 
 async def _non_stream(url: str, headers: dict, body: dict, messages: list[dict],

@@ -66,6 +66,14 @@ KEEP_RECENT_MAX_RATIO = 0.5
 # 可视化页面密钥的建议长度。短于这个只警告不拦截，但页面能看到全部摘要，别图省事。
 UI_TOKEN_MIN_LEN = 16
 
+# extra_body 里不允许出现的键：改了它们就不是"调参"而是把压缩本身绕过去了。
+PROTECTED_BODY_KEYS = ("messages", "stream")
+
+# forward_headers 永远不放行的头：鉴权头必须换成供应商的 key，
+# 其余几个由 httpx 按实际请求重算，透传过去只会自相矛盾。
+BLOCKED_HEADERS = {"authorization", "host", "content-length", "content-type",
+                   "connection", "transfer-encoding", "cookie", "accept-encoding"}
+
 
 class ConfigError(RuntimeError):
     pass
@@ -130,8 +138,43 @@ def _load_providers(cfg: dict[str, Any], warn) -> dict[str, dict[str, Any]]:
             "timeout_seconds": p.get("timeout_seconds", 300),
             "connect_timeout_seconds": p.get("connect_timeout_seconds", 30),
             "multimodal": bool(p.get("multimodal", True)),
+            "extra_body": _clean_extra_body(p.get("extra_body"), f"provider {name!r}", warn),
+            "forward_headers": _clean_headers(p.get("forward_headers"), f"provider {name!r}", warn),
+            "forward_query": bool(p.get("forward_query", False)),
         }
     return providers
+
+
+def _clean_extra_body(raw: Any, who: str, warn) -> dict[str, Any]:
+    """校验 extra_body：必须是映射，且不许覆盖 messages / stream。"""
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{who} 的 extra_body 必须是一个映射")
+    out = dict(raw)
+    for k in PROTECTED_BODY_KEYS:
+        if k in out:
+            warn("%s 的 extra_body 里的 %r 会被忽略：改它等于绕过压缩/破坏流式处理", who, k)
+            out.pop(k)
+    return out
+
+
+def _clean_headers(raw: Any, who: str, warn) -> list[str]:
+    """校验 forward_headers 白名单，剔除永远不该透传的头。"""
+    if not raw:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError(f"{who} 的 forward_headers 必须是一个列表")
+    out = []
+    for h in raw:
+        h = str(h).strip().lower()
+        if not h:
+            continue
+        if h in BLOCKED_HEADERS:
+            warn("%s 的 forward_headers 里的 %r 会被忽略（鉴权/传输层的头不能透传）", who, h)
+            continue
+        out.append(h)
+    return out
 
 
 def reload(warn=lambda *a, **k: None) -> dict[str, Any]:
@@ -264,6 +307,7 @@ def summary_endpoints() -> list[dict[str, Any]]:
             "api_key": _SECRETS["summary"],
             "model": s["model"],
             "max_attempts": max(1, int(s.get("main_max_attempts", 2))),
+            "extra_body": _clean_extra_body(s.get("extra_body"), "summary", lambda *a: None),
         })
     fb = s.get("fallback") or {}
     if fb.get("enabled") and fb.get("base_url") and _SECRETS.get("summary_fallback") and fb.get("model"):
@@ -272,7 +316,9 @@ def summary_endpoints() -> list[dict[str, Any]]:
             "base_url": str(fb["base_url"]).rstrip("/"),
             "api_key": _SECRETS["summary_fallback"],
             "model": fb["model"],
-            "max_attempts": max(1, int(fb.get("max_attempts", 3))),
+            # 备用模型没写 extra_body 就沿用主模型的（通常两边想关的思考是同一套）
+            "extra_body": _clean_extra_body(fb.get("extra_body", s.get("extra_body")),
+                                            "summary.fallback", lambda *a: None),
         })
     return out
 
