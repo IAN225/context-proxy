@@ -20,9 +20,10 @@
    后面所有结果都是噪声，直接停在这里。
 2. **对照**：再发一个故意瞎编的字段。
    - 400/422 且报错文本像"未知字段" → 这家**会校验**未知字段，
-     那么某字段返回 2xx 就是它真的认识这个字段；
-   - 2xx → 这家对未知字段**照单全收**，2xx 只代表不报错、不代表生效，
-     只能看"响应里有没有思考内容""reasoning_tokens 变没变"这类间接信号；
+     可用项已确认被上游识别，可按需写入 extra_body；
+   - 2xx → 这家对未知字段**照单全收**，可用项仅确认不会报错，
+     是否生效要结合 reasoning / content / token 等信号判断，
+     不要仅凭本次结果修改 extra_body；
    - 401/403/429/5xx/网络错误/看不出原因的 400 → **无法判断**，不给结论。
 3. **逐字段**：每个字段同样只在 2xx / 400-422 时下结论；
    429、5xx、网络错误一律归入"无法判断"（会先自动重试一次），
@@ -291,14 +292,15 @@ def _control_verdict(ctl: dict | None) -> tuple[bool | None, str]:
     if ctl is None:
         return None, "没跑对照组，无法判断这家认不认未知字段。"
     if ctl["kind"] == ACCEPT:
-        return False, ("对照组（瞎编的字段）返回 2xx → 这家**不校验未知字段**。\n"
-                       "所以下面的「可用」只说明不报错，不说明生效。判断是否真生效只能看：\n"
+        return False, ("对照组（瞎编的字段）返回 2xx → 这家**不校验未知字段**。\n\n"
+                       "这些字段仅确认不会报错，是否生效仍需结合 reasoning / content / token\n"
+                       "等信号判断，不要仅凭本次结果修改 extra_body。怎么看：\n"
                        "  - 思考类字段：开/关两次的「思考 N 字」或 reasoning_tokens 是否有差别\n"
                        "  - 其他字段：多跑几次看输出是否随之变化")
     if ctl["kind"] == REJECT and UNKNOWN_FIELD_PAT.search(ctl.get("note", "")):
         return True, (f"对照组（瞎编的字段）被拒（{ctl['status']}，报错文本指向未知字段）→\n"
-                      "这家**会校验未知字段**，因此下面「可用」的字段是上游真的认识的，\n"
-                      "可以放心写进 extra_body。")
+                      "这家**会校验未知字段**。\n\n"
+                      "可用项已确认被上游识别，可按需写入 extra_body。")
     if ctl["kind"] == REJECT:
         return None, (f"对照组被拒（{ctl['status']}），但报错文本看不出是不是在校验未知字段：\n"
                       f"  {ctl.get('note', '')[:200]}\n"
@@ -348,7 +350,10 @@ def _verdict(results: list[dict], recheck: dict | None) -> int:
         # 端点中途挂掉时，前面那些"可用"是在什么状态下测出来的已经说不清了
         print("\n结论不确定，先别照着改 config.yaml。")
         return 1
-    print("\n把可用的那一行抄进 config.yaml 对应的 extra_body，其余删掉。")
+    if strict:
+        print("\n把可用的那一行抄进 config.yaml 对应的 extra_body，其余删掉。")
+    else:
+        print("\n先按上面的信号确认字段真的生效了，再决定写不写进 config.yaml。")
     return 0
 
 

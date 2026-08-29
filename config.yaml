@@ -1,38 +1,33 @@
-# ============================================================
 # context-proxy 配置
-# 链路：AI Chat 客户端 -> 本代理 /<provider>/v1/chat/completions -> 模型 API 供应商
-# 除 tokenizer.encoding 外，本文件所有字段都支持热重载（./ctl.sh reload）
-# ============================================================
+# 链路：客户端 -> 本代理 /<provider>/v1/chat/completions -> 模型 API 供应商
+# 除 tokenizer.encoding 外全部支持热重载（./ctl.sh reload）
 
-# ===== 上游模型供应商（可配多个，每个自动生成 /<provider>/v1 端点）=====
-# name 就是 URL 里的 <provider>，自己起，只能用字母数字下划线连字符。
-# api_key 优先读环境变量 UPSTREAM_API_KEY__<NAME大写>（name 中的 - 换成 _）
+# ===== 上游供应商（可配多个，每个自动生成 /<provider>/v1 端点）=====
 providers:
-  # 多模态供应商示例：把 name 换成你自己的标识
+  # name 就是 URL 里的 <provider>，只能用字母数字下划线连字符
   - name: provider-a
     base_url: ""
-    api_key: ""
+    api_key: ""                                # 环境变量 UPSTREAM_API_KEY__PROVIDER_A 优先
     timeout_seconds: 300
     connect_timeout_seconds: 30
-    multimodal: true                           # false = 转发前剥掉历史里的图片，只留 [图片] 占位
+    multimodal: true                           # false = 转发前剥掉历史图片，只留 [图片] 占位
 
-    # 强制附加到每个请求上的参数，**会覆盖客户端发来的同名字段**。
-    # 用途是设置 chatbox 界面上表达不了的参数（比如思考强度）。
-    # messages / stream 不接受改写（改了等于绕过压缩、破坏流式处理），写了会被忽略并告警。
-    # ⚠️ 字段名各家不一样，而且写了上游不认识的字段有些网关会直接 400。
-    #    只保留你的供应商确实支持的那一行，其余删掉，改完先发一条消息验证。
-    extra_body:
-      reasoning_effort: "xhigh"                # 思考强度拉满（OpenAI o 系 / 部分网关：minimal|low|medium|high|xhigh）
-      # thinking: {type: "enabled", budget_tokens: 8000}   # Anthropic 系写法
-      # enable_thinking: true                              # Qwen / DeepSeek 系写法
-      # temperature: 1.0
+    # 强制附加到每个请求上的参数，**覆盖**客户端发来的同名字段。
+    # 用途：设置客户端界面上表达不了的参数（如思考强度）。messages / stream 不接受改写。
+    # 字段名各家不同，写错有的网关 400、有的默默忽略。
+    # 先跑 python3 tools/probe_body.py <provider> --model <模型> 问清楚，再解开对应那一行。
+    # extra_body:
+    #   reasoning_effort: "xhigh"              # OpenAI o 系 / 部分网关
+    #   thinking: {type: "enabled", budget_tokens: 8000}   # Anthropic 系
+    #   enable_thinking: true                  # Qwen / DeepSeek 系
+    #   temperature: 1.0
 
-    # 客户端请求头默认**不透传**（无脑转发会把 cookie、x-forwarded-for 一起漏给上游）。
-    # 需要哪个就在这里按名字白名单放行；Authorization 永远由代理换成上面的 api_key。
-    forward_headers: []                        # 例：["anthropic-beta", "http-referer", "x-title"]
-    forward_query: false                       # true = 把 ?xxx=yyy 查询串带给上游（Azure 的 api-version 需要）
+    forward_headers: []                        # 请求头默认不透传，按名字白名单放行
+                                               # 例：["anthropic-beta", "http-referer", "x-title"]
+                                               # Authorization 永远换成上面的 api_key，白名单无效
+    forward_query: false                       # true = 查询串带给上游（Azure 的 api-version 需要）
 
-  # 纯文本供应商示例：不支持图片的模型必须设 multimodal: false，否则带图历史会报错
+  # 不支持图片的模型必须设 multimodal: false，否则带图历史会报错
   - name: provider-b
     base_url: ""
     api_key: ""
@@ -47,47 +42,39 @@ summary:
   # --- 阈值 ---
   trigger_tokens: 39200                        # 等效总量超过此值触发压缩
   keep_recent_tokens: 19200                    # 近期原文的**硬性下限**（按轮对齐，只多不少）。
-                                               # 只要会话压缩过，之后任何路径转发给上游的逐字原文
-                                               # 都不会低于这个值（除非整个对话本身就没这么长）；
-                                               # 存量切点不满足时会把原文窗口往回退，宁可与摘要重叠。
-                                               # 【自动封顶】有效值不超过 trigger_tokens 的 50%，
-                                               # 写得再大也按 0.5×trigger 生效（写小于则按写的来）。
-                                               # 实际生效值见 /health 的 keep_recent_tokens_effective。
+                                               # 只要压缩过，之后任何路径转发给上游的逐字原文都不低于它。
+                                               # 自动封顶：有效值不超过 trigger_tokens 的 50%。
+                                               # 实际生效值见 /health 的 keep_recent_tokens_effective
   summary_total_cap_tokens: 12800              # 累积摘要超过此值触发二次重压
   summary_max_tokens: 2400                     # 单次摘要调用的输出上限
   summary_batch_tokens: 10000                  # 单批送入摘要模型的输入上限
-  max_batches_per_request: 4                   # 单个 HTTP 请求最多压几批，压不完带着已落盘进度返回
-  exit_gate_ratio: 1.2                         # 出口闸门：转发前实测 token 超过 trigger×此值直接拒绝
-
-  # --- checkpoint ---
-  checkpoint_keep: 10                          # 每个会话保留的最近 checkpoint 数（另加 1 条永久置顶的最早 checkpoint）
+  max_batches_per_request: 4                   # 单请求最多压几批，压不完带着已落盘进度返回
+  exit_gate_ratio: 1.2                         # 出口闸门：转发前实测超过 trigger×此值直接拒绝
+  checkpoint_keep: 10                          # 每会话保留的最近 checkpoint 数（另加 1 条置顶的最早的）
 
   # --- 摘要注入 ---
-  summary_role: "system"                       # 摘要以哪个角色注入：system / user
-                                               # 位置固定在 [开头 system] 之后、[近期原文] 之前——
-                                               # 前缀稳定，能最大概率命中上游的 prefix cache
+  summary_role: "system"                       # system / user。位置固定在 [开头 system] 之后、
+                                               # [近期原文] 之前，前缀稳定才好命中上游 prefix cache
 
   # --- 持久化 ---
-  persist_db: "logs/sessions.db"               # 会话/checkpoint 数据库，留空则纯内存（重启丢状态）
-  cache_max_entries: 1024                      # 会话级异步锁字典的 LRU 上限（防泄漏，正在持有的锁不会被淘汰）
+  persist_db: "logs/sessions.db"               # 留空则纯内存（重启丢状态）
+  cache_max_entries: 1024                      # 会话级异步锁字典的 LRU 上限
 
   # --- 摘要模型（主）---
   base_url: ""
   api_key: ""                                  # 环境变量 SUMMARY_API_KEY 优先
   model: "claude-opus-4-8"
   timeout_seconds: 180                         # 单次摘要调用超时（秒）
-  main_max_attempts: 2                         # 主模型可重试次数（仅对超时/5xx/429 生效）
-  min_output_tokens: 50                        # 输出（不含思考部分）低于此 token 数判定为失败
+  main_max_attempts: 2                         # 主模型重试次数（仅对超时/5xx/429 生效）
+  min_output_tokens: 50                        # 输出（不含思考）低于此 token 数判定为失败
 
-  # 摘要模型的附加参数。摘要是"照着原文复述要点"，思考没什么用还慢又贵，
-  # 温度低一点更稳，所以这里通常和主模型配得正好相反。
-  # 同样：字段名各家不同，只留你的供应商认识的那一行，其余删掉。
-  extra_body:
-    temperature: 0.5
-    # reasoning_effort: "minimal"              # OpenAI o 系：能给的最低档（部分网关支持 "none"）
-    # thinking: {type: "disabled"}             # Anthropic 系：关闭思考
-    # enable_thinking: false                   # Qwen / DeepSeek 系：关闭思考
-    # top_p: 0.9
+  # 摘要是照着原文复述要点，思考没什么用还慢又贵，温度低一点更稳——
+  # 所以这里通常和主模型配得正好相反。同样先用 probe_body.py 确认字段名。
+  # extra_body:
+  #   temperature: 0.5
+  #   reasoning_effort: "minimal"              # OpenAI o 系
+  #   thinking: {type: "disabled"}             # Anthropic 系
+  #   enable_thinking: false                   # Qwen / DeepSeek 系
 
   # --- 摘要模型（备）：主模型失败后切到这里 ---
   fallback:
@@ -95,9 +82,8 @@ summary:
     base_url: ""
     api_key: ""                                # 环境变量 SUMMARY_FALLBACK_API_KEY 优先
     model: ""
-    max_attempts: 3                            # 备用模型最多重试 3 次，仍失败则报错结束
-    # extra_body:                              # 不写就沿用上面主摘要模型的 extra_body
-    #   temperature: 0.5
+    max_attempts: 3                            # 仍失败则报错结束
+    # extra_body:                              # 不写就沿用主摘要模型的
 
   # --- 提示词（页面上也能改，见 /ui）---
   prompts:
@@ -161,25 +147,25 @@ summary:
       【重要】用户可能从较早的消息处创建了分支，上面的摘要与后续原文的衔接处可能存在重叠或跳跃，
       也可能包含已被用户修改掉的旧内容。凡摘要与后面的原文冲突之处，一律以原文为准。
 
+
 # ===== 可观测（给 /ui 的时间轴用）=====
 observability:
-  capture_timeline: false                      # 每次请求存一份「结构快照」，供页面画时间轴、
-                                               # 对比进来的和发出去的 payload。**只存结构，
-                                               # 加每轮开头 preview_chars 字的原文预览（未脱敏），
-                                               # 不存完整原文**。实测 4000 条的会话每请求约 +18ms
-                                               # （构建 13ms + 落盘 5ms），快照约 460KB，
-                                               # 每个会话只留最新一份（覆盖写）。默认关闭。
+  capture_timeline: false                      # 每次请求存一份结构快照，供页面画时间轴、
+                                               # 对比进来的和发出去的 payload。只存结构 +
+                                               # 每轮开头 preview_chars 字的原文预览（未脱敏）。
+                                               # 4000 条的会话每请求约 +18ms、快照约 460KB，
+                                               # 每会话只留最新一份（覆盖写）
   preview_chars: 60                            # 时间轴里每轮显示多少字预览
 
 # ===== 流式输出 =====
 stream:
   smooth_chars: 24                             # 每片字符数，0 = 关闭平滑直接透传
   smooth_delay: 0.008                          # 每片间隔秒
-  flush_backlog_chars: 600                     # 待发积压超过此字符数（或上游已结束）时丢弃剩余延迟，一次性吐完
+  flush_backlog_chars: 600                     # 积压超过此字符数（或上游已结束）时一次性吐完
 
 # ===== token 估算 =====
 tokenizer:
-  encoding: "cl100k_base"                      # tiktoken 编码（进程启动时固定，改后需 restart）
+  encoding: "cl100k_base"                      # tiktoken 编码（改后需 restart，不支持热重载）
   per_message_overhead: 12                     # 每条消息的固定结构开销
   image_tokens: 1100                           # 单张图片的等效 token 估值
 
@@ -187,20 +173,18 @@ tokenizer:
 server:
   host: "0.0.0.0"
   port: 8787
-  auth_token: ""                               # 代理自身鉴权 token（环境变量 PROXY_AUTH_TOKEN 优先，留空则不鉴权）
-                                               # 这个要填进 chatbox，会跟着每个对话请求走。
-                                               # ⚠️ 别把真实密钥提交进版本库，建议留空改用环境变量：
-                                               #    export PROXY_AUTH_TOKEN="sk-proxy-xxxx"
-  ui_token: ""                                 # 可视化页面 http://<IP>:<port>/ui 的登录密钥，建议 16 位
-                                               # 【留空 = 不启用页面】，环境变量 PROXY_UI_TOKEN 优先
-                                               # 用 ./ctl.sh ui-token 生成一个。两个 token 互不通用：
-                                               # ui_token 不能调 /chat/completions；而**一旦配了 ui_token，
-                                               # /admin/* 就只认 ui_token**，auth_token 不再有后台权限
-                                               # （没配 ui_token 时才退回 auth_token，供 ./ctl.sh 使用）
+  auth_token: ""                               # 代理自身鉴权（环境变量 PROXY_AUTH_TOKEN 优先）。
+                                               # 填进客户端，跟着每个对话请求走。
+                                               # 留空 = 不鉴权，谁都能用你的额度。
+                                               # ⚠️ 别把真实密钥提交进版本库，优先用环境变量
+  ui_token: ""                                 # /ui 页面的登录密钥，建议 16 位，留空 = 页面不启用
+                                               # （环境变量 PROXY_UI_TOKEN 优先，./ctl.sh ui-token 可生成）。
+                                               # 与 auth_token 双向隔离：ui_token 不能调对话接口；
+                                               # 配了 ui_token 后 /admin/* 也不再认 auth_token
 
 # ===== 日志 =====
 logging:
   level: "INFO"                                # DEBUG / INFO / WARNING / ERROR
-  file: "logs/proxy.log"                       # 进程内轮转写入，跨重启保留（留空则只打 stdout）
+  file: "logs/proxy.log"                       # 进程内轮转，跨重启保留（留空则只打 stdout）
   max_bytes: 20971520                          # 单文件 20MB
   backup_count: 5

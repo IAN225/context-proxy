@@ -1245,8 +1245,11 @@ def _run_probe(*args, env_extra=None):
 
 
 def _probe_line(txt: str, prefix: str) -> str:
-    """取报告结尾那几行汇总（"可用 (n)：..." / "被拒 (n)：..." / "无法判断 (n)：..."）。"""
-    return next((l for l in txt.splitlines() if l.startswith(prefix)), "")
+    """取报告结尾那几行汇总（"可用 (n)：..." / "被拒 (n)：..." / "无法判断 (n)：..."）。
+
+    带上 " (" 一起匹配：结论段落里也有以"可用项"开头的句子，光按两个字前缀会撞上。
+    """
+    return next((l for l in txt.splitlines() if l.startswith(prefix + " (")), "")
 
 
 def test_probe_stops_when_the_baseline_request_fails():
@@ -1269,7 +1272,7 @@ def test_probe_refuses_to_call_a_429_control_strict():
     out = _run_probe("mm", "--model", "mock-chat", "--only", "temperature")
     assert out.returncode == 1, out.stdout          # 跑完了，但结论不确定
     assert "无法判断" in out.stdout
-    assert "可以放心写进 extra_body" not in out.stdout, "429 不能当成严格校验"
+    assert "可按需写入 extra_body" not in out.stdout, "429 不能当成严格校验"
     assert "结论不确定" in out.stdout
     # 基线是好的，所以探针照跑，只是不下结论
     assert "temperature" in _probe_line(out.stdout, "可用")
@@ -1281,7 +1284,7 @@ def test_probe_refuses_to_conclude_on_a_500_or_network_error_control():
         ctl(field_status={"__cproxy_probe_nonexistent__": status})
         out = _run_probe("mm", "--model", "mock-chat", "--only", "temperature")
         assert out.returncode == 1, (status, out.stdout)
-        assert "可以放心写进 extra_body" not in out.stdout, status
+        assert "可按需写入 extra_body" not in out.stdout, status
         assert "不校验未知字段" not in out.stdout, status
 
 
@@ -1303,7 +1306,7 @@ def test_probe_reports_rejected_fields_on_a_strict_upstream():
                      "--only", "temperature,top_p,reasoning_effort,enable_thinking")
     assert out.returncode == 0, out.stdout
     txt = out.stdout
-    assert "会校验未知字段" in txt, txt
+    assert "会校验未知字段" in txt and "可按需写入 extra_body" in txt, txt
     assert "temperature" in _probe_line(txt, "可用")
     rejected = _probe_line(txt, "被拒")
     assert "reasoning_effort=minimal" in rejected and "enable_thinking=true" in rejected
@@ -1320,7 +1323,8 @@ def test_probe_flags_a_lenient_upstream_as_inconclusive():
     out = _run_probe("mm", "--model", "mock-chat", "--only", "reasoning_effort,temperature")
     assert out.returncode == 0, out.stdout
     txt = out.stdout
-    assert "不校验未知字段" in txt and "不说明生效" in txt, txt
+    assert "不校验未知字段" in txt, txt
+    assert "仅确认不会报错" in txt and "不要仅凭本次结果修改 extra_body" in txt, txt
     assert "真的产生了思考内容的组合" in txt
     assert "reasoning_effort=high" in txt.split("真的产生了思考内容的组合")[1]
     # temperature 没被列进 reasoning_for，不该被误报成"开了思考"
