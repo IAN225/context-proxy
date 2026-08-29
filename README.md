@@ -28,10 +28,9 @@ chatbox ──> context-proxy :8787/<provider>/v1 ──> 模型 API
 ```bash
 cd ~/context-proxy
 python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
-cp config.yaml config.yaml.bak      # 备份后按下面改
 ```
 
-`config.yaml` 至少要改这几处（其余项都有可用默认值，注释在文件里）：
+**1. 填 `config.yaml`**，只有这几处必填，其余都有可用默认值：
 
 ```yaml
 providers:
@@ -41,54 +40,66 @@ providers:
     multimodal: true                 # 纯文本模型必须设 false，否则带图历史会报错
 
 summary:
-  trigger_tokens: 39200              # 等效总量超过就压
-  keep_recent_tokens: 19200          # 保留的近期原文下限
   base_url: "https://your-gateway/v1"
   api_key: "sk-..."
   model: "便宜的摘要模型"
-  fallback:                          # 可选：主摘要模型失败后的备用
-    enabled: true
-    base_url: "..."
-    api_key: "..."
-    model: "..."
 
 server:
-  auth_token: "sk-proxy-自定义一个"   # chatbox 里填这个，不是供应商的 key
+  auth_token: "sk-proxy-自己起一个"   # 客户端里填这个，不是供应商的 key
 ```
 
-> 密钥可以走环境变量，优先级高于明文：
-> `UPSTREAM_API_KEY__<NAME大写>`、`SUMMARY_API_KEY`、`SUMMARY_FALLBACK_API_KEY`、
-> `PROXY_AUTH_TOKEN`、`PROXY_UI_TOKEN`。仓库里的 `config.yaml` 这几项都是空的，
-> **别把真实密钥填进去再提交**——要么用环境变量，要么把 config.yaml 加进 `.gitignore`。
-
-启动：
+**2. 启动并自检**
 
 ```bash
-chmod +x ctl.sh && ./ctl.sh start     # 本地调试用；长期运行请用下面的 systemd
+chmod +x ctl.sh && ./ctl.sh start     # 本地调试用；长期运行见下面的 systemd
+curl -s localhost:8787/health | python3 -m json.tool
 ```
 
-在 chatbox 里按 OpenAI 兼容接口接入：
+**3. 在客户端里按 OpenAI 兼容接口接入**
 
 | 字段 | 值 |
 |---|---|
 | API Base URL | `http://<服务器IP>:8787/<provider>/v1` |
 | API Key | `server.auth_token`（**不是供应商的 key**） |
 
-`<provider>` 换成 `config.yaml` 里配的任意 `name`。每个供应商一个独立 URL，
-保存后 chatbox 会自动从 `/<provider>/v1/models` 拉到模型列表。
+`<provider>` 换成 `config.yaml` 里配的任意 `name`，每个供应商一个独立 URL，
+保存后客户端会自动从 `/<provider>/v1/models` 拉到模型列表。发一条消息能收到回复就通了。
 
-### 参数怎么传给上游
+**4.（可选）**想调思考强度这类参数、开可视化页面、改摘要提示词，见下面各节。
+
+> 密钥都可以走环境变量，优先级高于明文：`UPSTREAM_API_KEY__<NAME大写>`、
+> `SUMMARY_API_KEY`、`SUMMARY_FALLBACK_API_KEY`、`PROXY_AUTH_TOKEN`、`PROXY_UI_TOKEN`。
+> 仓库里的 `config.yaml` 这几项都是空的，**别填了真实密钥再提交**。
+
+阈值按需要调，默认值对应约 39k 触发压缩、保留约 19k 近期原文：
+
+```yaml
+summary:
+  trigger_tokens: 39200              # 等效总量超过就压
+  keep_recent_tokens: 19200          # 近期原文的硬性下限（自动封顶在 trigger 的 50%）
+  fallback:                          # 可选：主摘要模型失败后的备用
+    enabled: true
+    base_url: "..."
+    api_key: "..."
+    model: "..."
+```
+
+---
+
+## 参数与请求头
 
 `messages` 之外的 body 字段**一律原样透传**——`temperature`、`top_p`、`seed`、`tools`、
-`response_format`、各家的思考开关，以及任何厂商私有字段，代理都不认识也不改动，
+`response_format`、各家的思考开关、任何厂商私有字段，代理都不认识也不改动，
 所以将来出现的新参数自动就支持。
 
-想强制某个 chatbox 界面上表达不了的参数（比如思考强度），用 `extra_body`：
+想强制某个客户端界面上表达不了的参数（比如思考强度），用 `extra_body`。
+它**覆盖**客户端发来的同名字段；`messages` / `stream` 不接受改写（改了等于绕过压缩、
+破坏流式处理），写了会被忽略并告警。
 
 ```yaml
 providers:
   - name: <provider>
-    extra_body:                    # 会覆盖客户端发来的同名字段
+    extra_body:
       reasoning_effort: "xhigh"
 
 summary:
@@ -97,12 +108,9 @@ summary:
     enable_thinking: false
 ```
 
-> ⚠️ 思考开关的字段名各家不同（`reasoning_effort` / `thinking` / `enable_thinking` …），
-> 写了上游不认识的字段有些网关会直接 400。config.yaml 里几种写法都列了并注释掉，
-> **只留你的供应商确实支持的那一行**。
-> `messages` 和 `stream` 不接受改写（改了等于绕过压缩、破坏流式处理），写了会被忽略并告警。
-
-不知道该留哪一行就别猜，直接问上游：
+⚠️ 思考开关的字段名各家不同（`reasoning_effort` / `thinking` / `enable_thinking` …），
+写错的后果还分两种：有的网关直接 400，有的默默丢掉——你以为思考开了其实没开。
+所以 `config.yaml` 里几种写法都注释掉了，**别猜，直接问上游**：
 
 ```bash
 python3 tools/probe_body.py <provider> --model <模型名>   # 直连上游逐个字段试
@@ -110,25 +118,22 @@ python3 tools/probe_body.py summary                       # 试主摘要模型
 python3 tools/probe_body.py <provider> --model <模型名> --via-proxy   # 走代理，顺带验证透传
 ```
 
-一个字段发一次最小请求（十几 token），最后打出「可用 / 被拒 / 无法判断」，
-把可用的抄进 `extra_body` 即可。判定分三步，**任何一步不成立就不下结论**：
+一个字段发一次最小请求（十几 token），最后打出「可用 / 被拒 / 无法判断」。
+判定分三步，**任何一步证据不足都不下结论**：
 
-1. **基线**——先发一条不带任何探针字段的请求。它必须 2xx，否则问题出在
-   key / 模型名 / base_url / 余额上，后面每个字段都会"失败"，那份清单没有意义，
-   脚本直接停在这里（退出码 2）。
-2. **对照**——再发一个故意瞎编的字段：
-   - 400/422 **且报错文本确实在说"这字段我不认识"** → 这家会校验未知字段，
-     那么「可用」的就是上游真认识的；
-   - 2xx → 这家照单全收，**2xx 只代表不报错、不代表生效**，
-     此时只能看报告里"真的产生了思考内容的组合"这类间接信号；
-   - 401 / 403 / 429 / 5xx / 网络错误 / 看不出原因的 400 → **无法判断**，不给结论
-     （退出码 1）。限流不等于"这家很严格"。
-3. **逐字段**——同样只在 2xx / 400-422 时下结论。429、5xx、网络错误先自动重试一次，
-   还不行就归入「无法判断」，不会把一次抖动写成"这个字段不认"。
-   出现存疑项时脚本会回头再测一次基线，确认不是端点中途挂了。
+| 步骤 | 请求 | 结果 |
+|---|---|---|
+| 1 基线 | 不带任何探针字段 | 非 2xx → 中止（退出码 2）。问题在 key / 模型名 / base_url / 余额，不在字段上 |
+| 2 对照 | 一个瞎编的字段 | 400/422 **且报错文本确实在说"不认识这字段"** → 严格；2xx → 宽松；其余 → 无法判断（退出码 1） |
+| 3 逐字段 | 每个候选字段 | 2xx → 可用；400/422 → 被拒；其余 → 无法判断 |
 
-`--only` 挑几个探针跑，`--extra '{"top_k": 20}'` 试自己的字段。
-注意这些是**真实计费**的调用，只是每次都很短。
+- 判为**严格**时：可用项已确认被上游识别，可按需写入 `extra_body`。
+- 判为**宽松**时：可用项仅确认不会报错，是否生效要结合报告里的
+  「思考 N 字」/ `reasoning_tokens` 等信号判断，别仅凭这一次结果就改配置。
+- 「无法判断」的字段（429 / 5xx / 网络错误，重试一次仍失败）**别动**，
+  那是这次没问出结果，不是上游不认。`--only <字段>` 过会儿单独重跑。
+
+`--extra '{"top_k": 20}'` 可以试自己的字段。注意这些是**真实计费**的调用，只是每次都很短。
 
 请求头默认**不透传**（无脑转发会把 cookie、`x-forwarded-for` 一起漏给上游），
 需要哪个按名字白名单放行；查询串同理：
