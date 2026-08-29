@@ -1237,40 +1237,88 @@ def test_query_string_forwarding_is_opt_in():
 def _run_probe(*args, env_extra=None):
     import subprocess
     # 显式钉住 PROXY_CONFIG：同一次 pytest 里别的测试模块也会改这个环境变量
-    return subprocess.run([sys.executable, str(ROOT / "tools" / "probe_body.py"), *args],
+    return subprocess.run([sys.executable, str(ROOT / "tools" / "probe_body.py"), *args,
+                           "--retry-delay", "0"],
                           capture_output=True, text=True, cwd=ROOT,
                           env={**os.environ, "PROXY_CONFIG": str(CFG_PATH),
                                **(env_extra or {})})
 
 
 def _probe_line(txt: str, prefix: str) -> str:
-    """取报告结尾那两行汇总（"可用 (n)：..." / "被拒 (n)：..."）。"""
-    return next(l for l in txt.splitlines() if l.startswith(prefix))
+    """取报告结尾那几行汇总（"可用 (n)：..." / "被拒 (n)：..." / "无法判断 (n)：..."）。"""
+    return next((l for l in txt.splitlines() if l.startswith(prefix)), "")
+
+
+def test_probe_stops_when_the_baseline_request_fails():
+    """基线都发不出去时，后面每个字段都会"失败"，那份清单没有意义——必须停。"""
+    fresh()
+    ctl(chat_status=401)
+    out = _run_probe("mm", "--model", "mock-chat", "--only", "temperature,reasoning_effort")
+    assert out.returncode == 2, out.stdout
+    assert "基线请求就没成功" in out.stdout and "探测中止" in out.stdout
+    assert "api_key" in out.stdout, "要指出该去查什么"
+    # 关键：一个探针都没发出去，没白烧钱也没生成假清单
+    assert len(chat_calls()) == 1, [c["extra"] for c in chat_calls()]
+    assert "可用" not in out.stdout and "会校验未知字段" not in out.stdout
+
+
+def test_probe_refuses_to_call_a_429_control_strict():
+    """对照组被限流 ≠ 这家会校验未知字段。这正是之前会误诊的那条路径。"""
+    fresh()
+    ctl(field_status={"__cproxy_probe_nonexistent__": 429})
+    out = _run_probe("mm", "--model", "mock-chat", "--only", "temperature")
+    assert out.returncode == 1, out.stdout          # 跑完了，但结论不确定
+    assert "无法判断" in out.stdout
+    assert "可以放心写进 extra_body" not in out.stdout, "429 不能当成严格校验"
+    assert "结论不确定" in out.stdout
+    # 基线是好的，所以探针照跑，只是不下结论
+    assert "temperature" in _probe_line(out.stdout, "可用")
+
+
+def test_probe_refuses_to_conclude_on_a_500_or_network_error_control():
+    fresh()
+    for status in (500, 403):
+        ctl(field_status={"__cproxy_probe_nonexistent__": status})
+        out = _run_probe("mm", "--model", "mock-chat", "--only", "temperature")
+        assert out.returncode == 1, (status, out.stdout)
+        assert "可以放心写进 extra_body" not in out.stdout, status
+        assert "不校验未知字段" not in out.stdout, status
+
+
+def test_probe_refuses_to_conclude_on_a_400_that_is_not_about_unknown_fields():
+    """400 也不够——得看报错文本真的在说"这个字段我不认识"。"""
+    fresh()
+    ctl(strict_body=True, strict_message="You exceeded your current quota")
+    out = _run_probe("mm", "--model", "mock-chat", "--only", "temperature")
+    assert out.returncode == 1, out.stdout
+    assert "看不出是不是在校验未知字段" in out.stdout
+    assert "You exceeded your current quota" in out.stdout, "要把上游原文摆出来给人判断"
 
 
 def test_probe_reports_rejected_fields_on_a_strict_upstream():
-    """严格网关：对照组被拒 → 报告能断言"OK 的就是真认识的"。"""
+    """严格网关：基线通过 + 对照被 400 拒且文本指向未知字段 → 才敢下结论。"""
     fresh()
     ctl(strict_body=True, reasoning_for=[])
     out = _run_probe("mm", "--model", "mock-chat",
                      "--only", "temperature,top_p,reasoning_effort,enable_thinking")
-    assert out.returncode == 0, out.stderr
+    assert out.returncode == 0, out.stdout
     txt = out.stdout
     assert "会校验未知字段" in txt, txt
     assert "temperature" in _probe_line(txt, "可用")
     rejected = _probe_line(txt, "被拒")
     assert "reasoning_effort=minimal" in rejected and "enable_thinking=true" in rejected
-    # 每个探针都真发了一次请求，且都是最小请求（不会顺手把账单打爆）
+    assert _probe_line(txt, "无法判断") == "", "没有存疑项时不该打这一行"
+    # 每个探针都真发了一次最小请求（含基线），不会顺手把账单打爆
     probes = [c for c in chat_calls() if c["n_messages"] == 1]
-    assert len(probes) >= 5 and all(c["chars"] < 200 for c in probes)
+    assert len(probes) >= 7 and all(c["chars"] < 200 for c in probes)
 
 
 def test_probe_flags_a_lenient_upstream_as_inconclusive():
-    """宽松网关：什么都收 200，报告必须说清楚"不代表生效"，并给出思考侧信号。"""
+    """宽松网关：什么都收 2xx，报告必须说清楚"不代表生效"，并给出思考侧信号。"""
     fresh()
     ctl(strict_body=False, reasoning_for=["reasoning_effort", "thinking"])
     out = _run_probe("mm", "--model", "mock-chat", "--only", "reasoning_effort,temperature")
-    assert out.returncode == 0, out.stderr
+    assert out.returncode == 0, out.stdout
     txt = out.stdout
     assert "不校验未知字段" in txt and "不说明生效" in txt, txt
     assert "真的产生了思考内容的组合" in txt
@@ -1279,12 +1327,49 @@ def test_probe_flags_a_lenient_upstream_as_inconclusive():
     assert "temperature" not in txt.split("真的产生了思考内容的组合")[1]
 
 
+def test_probe_retries_a_transient_failure_before_judging_a_field():
+    """单个字段撞上一次限流，重试一次就好了——不该因此被记成"被拒"。"""
+    fresh()
+    ctl(strict_body=True, field_status={"temperature": 429}, field_status_once=True)
+    out = _run_probe("mm", "--model", "mock-chat", "--only", "temperature,top_p")
+    assert out.returncode == 0, out.stdout
+    assert "(重试过)" in out.stdout
+    assert "temperature" in _probe_line(out.stdout, "可用"), out.stdout
+    assert "temperature" not in _probe_line(out.stdout, "被拒")
+
+
+def test_probe_keeps_a_persistently_failing_field_out_of_the_rejected_list():
+    """一直 429 的字段归入"无法判断"，并提示别照着改配置、单独重跑。"""
+    fresh()
+    ctl(strict_body=True, field_status={"temperature": 429})
+    out = _run_probe("mm", "--model", "mock-chat", "--only", "temperature,top_p")
+    assert out.returncode == 0, out.stdout      # 对照组本身是有结论的
+    unsure = _probe_line(out.stdout, "无法判断")
+    assert "temperature" in unsure and "top_p" not in unsure
+    assert "temperature" not in _probe_line(out.stdout, "被拒")
+    assert "别据此改 config.yaml" in out.stdout
+    # 存疑时回头复查基线，确认不是端点整个挂了
+    assert "基线复查" in out.stdout and "仍然正常" in out.stdout
+
+
+def test_probe_reports_when_the_endpoint_died_midway():
+    """探测中途端点挂了：复查基线也失败 → 整轮结果都不可信，必须收回结论。"""
+    fresh()
+    # 前 4 次正常（基线、对照、temperature ×2），之后全挂——最后那次复查基线就会失败
+    ctl(field_status={"temperature": 503}, chat_status=503, chat_status_after=5)
+    out = _run_probe("mm", "--model", "mock-chat", "--only", "temperature")
+    assert out.returncode == 1, out.stdout
+    assert "基线复查" in out.stdout and "也失败了" in out.stdout
+    assert "整轮结果都不可信" in out.stdout
+    assert "结论不确定" in out.stdout
+
+
 def test_probe_accepts_custom_fields_and_reports_upstream_error_text():
     fresh()
     ctl(strict_body=True)
     out = _run_probe("mm", "--model", "mock-chat", "--only", "temperature",
                      "--extra", '{"厂商私有字段": 1}')
-    assert out.returncode == 0, out.stderr
+    assert out.returncode == 0, out.stdout
     assert "厂商私有字段(自定义)" in out.stdout
     # 上游的原始报错要照抄出来，不然用户不知道为什么被拒
     assert "Unrecognized request argument" in out.stdout
