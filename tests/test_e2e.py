@@ -48,7 +48,10 @@ BASE_SUMMARY = {
 }
 
 
-def write_config(db_name: str, **summary_overrides) -> None:
+UI_TOKEN = "uiTOKEN0123456789"
+
+
+def write_config(db_name: str, ui_token: str = "", **summary_overrides) -> None:
     cfg = {
         "providers": [
             {"name": "mm", "base_url": f"{MOCK}/v1", "api_key": "sk-up",
@@ -59,7 +62,8 @@ def write_config(db_name: str, **summary_overrides) -> None:
         "summary": {**BASE_SUMMARY, "persist_db": db_name, **summary_overrides},
         "stream": {"smooth_chars": 8, "smooth_delay": 0.001, "flush_backlog_chars": 200},
         "tokenizer": {"encoding": "cl100k_base", "per_message_overhead": 4, "image_tokens": 1100},
-        "server": {"host": "127.0.0.1", "port": PROXY_PORT, "auth_token": TOKEN},
+        "server": {"host": "127.0.0.1", "port": PROXY_PORT, "auth_token": TOKEN,
+                   "ui_token": ui_token},
         "logging": {"level": "INFO", "file": "logs/proxy.log"},
     }
     CFG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -101,10 +105,12 @@ def servers():
 _counter = {"n": 0}
 
 
-def fresh(**summary_overrides) -> None:
+def fresh(ui_token: str = "", **summary_overrides) -> None:
     """给每个用例一个干净的 DB 和配置。"""
     _counter["n"] += 1
-    write_config(f"db/t{_counter['n']}.db", **summary_overrides)
+    from cproxy import app as _a
+    _a._FAIL.clear()                      # 清掉上个用例攒下的鉴权失败计数
+    write_config(f"db/t{_counter['n']}.db", ui_token=ui_token, **summary_overrides)
     app_module.do_reload()
     httpx.post(f"{MOCK}/__reset", timeout=5)
 
@@ -454,9 +460,12 @@ def test_recompress_writes_new_checkpoint_and_keeps_history():
     kinds = [c["kind"] for c in detail["checkpoints"]]
     assert "recompress" in kinds, kinds
     assert any(c["pinned"] for c in detail["checkpoints"]), "最早的 checkpoint 必须永久保留"
-    # 二次重压走的是 merge 提示词，不会产生多份同名章节
-    merged = next(c for c in detail["checkpoints"] if c["kind"] == "recompress")["summary"]
-    assert merged.count("## 用户背景与偏好") <= 1
+    # 二次重压和批次摘要同构：按阈值分批 + 系统拼接，没有额外的"合并成稿"调用
+    recompress_calls = [c for c in summary_calls() if "需要精简的摘要内容" in c["prompt"]]
+    assert recompress_calls, "应当调过二次重压"
+    assert not any("合并" in c["prompt"] for c in summary_calls()), "不该再有单独的合并调用"
+    merged = _summary_api(sessions()[0]["conv_id"]).json()["summary"]
+    assert merged and len(merged) < 4000
 
 
 def test_checkpoint_window_keeps_earliest_and_recent():
@@ -778,3 +787,351 @@ def test_stuck_window_recovers_without_edit_and_survives_editing_last_message():
     grown_body = len([m for m in grown if m.get("role") != "system"])
     assert chat_calls()[-1]["n_messages"] == 2 + (grown_body - s["compressed_upto"]), \
         "推进之后窗口就等于已压缩位置，不再重叠"
+
+
+# ---- 手工查看 / 修改摘要 ----
+
+def _summary_api(conv_id, **kw):
+    return httpx.get(f"{PROXY}/admin/session/{conv_id}/summary", headers=HEADERS,
+                     params=kw, timeout=10)
+
+
+def _put_summary(conv_id, text, base_seq=None):
+    body = {"summary": text}
+    if base_seq is not None:
+        body["base_seq"] = base_seq
+    return httpx.put(f"{PROXY}/admin/session/{conv_id}/summary", headers=HEADERS,
+                     json=body, timeout=10)
+
+
+def test_manual_summary_view_and_edit_takes_effect():
+    fresh()
+    history = convo(30)
+    assert post("mm", history).status_code == 200
+    cid = sessions()[0]["conv_id"]
+
+    got = _summary_api(cid).json()
+    assert got["summary"] and got["editable"] is True
+    assert got["base_seq"] == 1 and got["total_rounds"] == 30
+    # 纯文本视图，方便重定向到文件
+    assert _summary_api(cid, format="text").text == got["summary"]
+
+    hand = "## 用户背景与偏好\n用户叫小苦，讨厌被叫全名。\n## 关键事实与专有名词\n- 猫叫豆豆"
+    r = _put_summary(cid, hand, base_seq=got["base_seq"])
+    assert r.status_code == 200, r.text
+    assert r.json()["new_seq"] == 2
+
+    # 原 checkpoint 留着可回退，新的是 manual
+    detail = session_detail(cid)
+    kinds = {c["seq"]: c["kind"] for c in detail["checkpoints"]}
+    assert kinds[2] == "manual" and kinds[1] == "incremental"
+
+    # 下一次请求就用改过的摘要，且位置信息原样沿用
+    assert post("mm", history).status_code == 200
+    sysmsg = chat_calls()[-1]["system_preview"]
+    assert _summary_api(cid).json()["summary"] == hand
+    assert sessions()[0]["compressed_upto"] == detail["checkpoints"][0]["compressed_upto"]
+
+
+def test_manual_summary_is_carried_forward_by_later_compression():
+    fresh()
+    history = convo(30)
+    assert post("mm", history).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    hand = "## 关键事实与专有名词\n- 这段是人写的，后续压缩必须保留它"
+    assert _put_summary(cid, hand).status_code == 200
+
+    grown = history + convo(30, start=400)
+    assert post("mm", grown).status_code == 200
+    now = _summary_api(cid).json()["summary"]
+    assert now.startswith(hand), "后续压缩应当在手工摘要之后追加，而不是覆盖"
+
+
+def test_manual_summary_rejects_stale_base_seq_and_open_event():
+    fresh()
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    seq = _summary_api(cid).json()["base_seq"]
+
+    assert _put_summary(cid, "改动一", base_seq=seq).status_code == 200
+    # 拿着旧的 base_seq 再存 -> 409，不会覆盖别人的更新
+    r = _put_summary(cid, "改动二", base_seq=seq)
+    assert r.status_code == 409 and "已被更新" in r.json()["error"]["message"]
+    assert _summary_api(cid).json()["summary"] == "改动一"
+
+    # 压缩事件没收尾时拒绝编辑
+    fresh(max_batches_per_request=1)
+    post("mm", convo(60))
+    cid2 = sessions()[0]["conv_id"]
+    assert _summary_api(cid2).json()["editable"] is False
+    r = _put_summary(cid2, "趁着压缩没完偷偷改")
+    assert r.status_code == 409 and "正在压缩中" in r.json()["error"]["message"]
+
+
+def test_manual_summary_rejects_empty_and_over_cap():
+    fresh(summary_total_cap_tokens=200)
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    assert _put_summary(cid, "   ").status_code == 400
+    r = _put_summary(cid, "太长了" * 500)
+    assert r.status_code == 400 and "summary_total_cap_tokens" in r.json()["error"]["message"]
+
+
+def test_ctl_sh_edit_round_trip():
+    """真跑一遍 ./ctl.sh edit，用假编辑器改写文件。"""
+    import subprocess
+    fresh()
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+
+    fake_editor = TMP / "fake_editor.sh"
+    fake_editor.write_text("#!/bin/sh\nprintf '%s' '## 关键事实与专有名词\\n- 由 ctl.sh 写入' > \"$1\"\n")
+    fake_editor.chmod(0o755)
+    env = {**os.environ, "EDITOR": str(fake_editor), "PROXY_AUTH_TOKEN": TOKEN,
+           "PROXY_PORT": str(PROXY_PORT)}
+
+    out = subprocess.run(["bash", str(ROOT / "ctl.sh"), "summary", cid[:12]],
+                         capture_output=True, text=True, env=env, cwd=ROOT)
+    assert out.returncode == 0 and "##" in out.stdout, out
+
+    out = subprocess.run(["bash", str(ROOT / "ctl.sh"), "edit", cid[:12]],
+                         capture_output=True, text=True, env=env, cwd=ROOT)
+    assert out.returncode == 0, out.stderr
+    assert '"status": "updated"' in out.stdout, out.stdout
+    assert "由 ctl.sh 写入" in _summary_api(cid).json()["summary"]
+
+
+# ---- 可视化页面与鉴权 ----
+
+def test_ui_disabled_without_token():
+    fresh()
+    r = httpx.get(f"{PROXY}/ui", timeout=5)
+    assert r.status_code == 404
+    assert "ui_token" in r.json()["error"]["message"]
+
+
+def test_ui_page_served_when_token_set():
+    fresh(ui_token=UI_TOKEN)
+    r = httpx.get(f"{PROXY}/ui", timeout=5)
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/html")
+    body = r.text
+    assert "context-proxy" in body and "ui_token" in body
+    # 自包含：不引任何外部资源
+    assert "http://" not in body.replace("http://127.0.0.1", "") or "cdn" not in body.lower()
+    assert "<script src" not in body and "<link" not in body
+    # 密钥绝不能出现在页面里
+    assert UI_TOKEN not in body
+
+
+def test_ui_token_reaches_admin_but_not_chat():
+    fresh(ui_token=UI_TOKEN)
+    ui_h = {"Authorization": f"Bearer {UI_TOKEN}"}
+    assert httpx.get(f"{PROXY}/admin/sessions", headers=ui_h, timeout=5).status_code == 200
+    # ui_token 不能拿来调对话接口（不然等于把付费通道也交出去了）
+    r = httpx.post(f"{PROXY}/mm/v1/chat/completions", headers=ui_h,
+                   json={"model": "mock-chat", "messages": convo(2)}, timeout=10)
+    assert r.status_code == 401
+    # auth_token 仍然两边都能用，ctl.sh 不受影响
+    assert httpx.get(f"{PROXY}/admin/sessions", headers=HEADERS, timeout=5).status_code == 200
+    assert post("mm", convo(2)).status_code == 200
+
+
+def test_wrong_key_is_rejected_then_throttled():
+    fresh(ui_token=UI_TOKEN)
+    bad = {"Authorization": "Bearer wrong-key-here"}
+    codes = [httpx.get(f"{PROXY}/admin/sessions", headers=bad, timeout=5).status_code
+             for _ in range(12)]
+    assert codes[0] == 401
+    assert 429 in codes, f"连续错误应当触发限流: {codes}"
+    # 限流是按来源计的，正确密钥此时也会被挡（同一来源），清掉计数后恢复
+    from cproxy import app as _a
+    _a._FAIL.clear()
+    assert httpx.get(f"{PROXY}/admin/sessions", headers=HEADERS, timeout=5).status_code == 200
+
+
+def test_ui_summary_edit_flow_through_admin_api():
+    """页面用的就是这几个接口，用 ui_token 完整走一遍。"""
+    fresh(ui_token=UI_TOKEN)
+    assert post("mm", convo(30)).status_code == 200
+    ui_h = {"Authorization": f"Bearer {UI_TOKEN}"}
+    cid = httpx.get(f"{PROXY}/admin/sessions", headers=ui_h, timeout=5).json()["sessions"][0]["conv_id"]
+    got = httpx.get(f"{PROXY}/admin/session/{cid}/summary", headers=ui_h, timeout=5).json()
+    r = httpx.put(f"{PROXY}/admin/session/{cid}/summary", headers=ui_h, timeout=5,
+                  json={"summary": "## 关键事实\n页面改的", "base_seq": got["base_seq"]})
+    assert r.status_code == 200 and r.json()["new_seq"] == got["base_seq"] + 1
+
+
+# ---- 提示词读写 ----
+
+def test_prompt_edit_takes_effect_and_can_be_reset():
+    fresh(ui_token=UI_TOKEN)
+    got = httpx.get(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5).json()["prompts"]
+    names = {p["name"] for p in got}
+    assert names == {"batch_system", "recompress", "injection", "fallback_notice"}
+    assert all(p["overridden"] is False for p in got)
+
+    mark = "【这是页面上改的批次摘要提示词】"
+    r = httpx.put(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5,
+                  json={"prompts": {"batch_system": mark + "请压缩下面的对话。"}})
+    assert r.status_code == 200 and r.json()["overridden"] == ["batch_system"]
+
+    # 下一次压缩就用改过的提示词
+    assert post("mm", convo(30)).status_code == 200
+    assert any(mark in c.get("system_preview", "") for c in summary_calls()), \
+        [c.get("system_preview") for c in summary_calls()][:2]
+
+    # 覆盖项跨热重载存活（存在 DB 里，不回写 config.yaml）
+    app_module.do_reload()
+    after = {p["name"]: p for p in
+             httpx.get(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5).json()["prompts"]}
+    assert after["batch_system"]["overridden"] is True
+    assert mark in after["batch_system"]["effective"]
+    assert mark not in after["batch_system"]["from_file"], "config.yaml 不该被回写"
+
+    # 提交空字符串 = 恢复文件里的值
+    httpx.put(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5,
+              json={"prompts": {"batch_system": ""}})
+    back = {p["name"]: p for p in
+            httpx.get(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5).json()["prompts"]}
+    assert back["batch_system"]["overridden"] is False
+
+
+def test_injection_prompt_must_keep_placeholder():
+    fresh(ui_token=UI_TOKEN)
+    r = httpx.put(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5,
+                  json={"prompts": {"injection": "忘了写占位符"}})
+    assert r.status_code == 400 and "{summary}" in r.json()["error"]["message"]
+    r = httpx.put(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5,
+                  json={"prompts": {"不存在的提示词": "x"}})
+    assert r.status_code == 400
+
+
+# ---- 时间轴 ----
+
+def test_timeline_disabled_by_default():
+    fresh()
+    assert post("mm", convo(30)).status_code == 200
+    r = httpx.get(f"{PROXY}/admin/session/{sessions()[0]['conv_id']}/timeline",
+                  headers=HEADERS, timeout=5)
+    assert r.status_code == 404 and "capture_timeline" in r.json()["error"]["message"]
+
+
+def test_timeline_marks_folded_rounds():
+    _counter["n"] += 1
+    write_config(f"db/tl{_counter['n']}.db", ui_token=UI_TOKEN)
+    cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    cfg["observability"] = {"capture_timeline": True, "preview_chars": 40}
+    CFG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    app_module.do_reload()
+    httpx.post(f"{MOCK}/__reset", timeout=5)
+
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    tl = httpx.get(f"{PROXY}/admin/session/{cid}/timeline", headers=HEADERS, timeout=5).json()
+
+    assert tl["total_rounds"] == 30 and len(tl["rounds"]) == 30
+    assert tl["in"]["messages"] == 60 and tl["out"]["messages"] < 60
+    assert tl["out"]["tokens"] < tl["in"]["tokens"], "发出去的应当远小于进来的"
+
+    folded = [r for r in tl["rounds"] if r["c"]]
+    kept = [r for r in tl["rounds"] if not r["c"]]
+    assert folded and kept, "应当既有被折叠的轮次也有逐字保留的"
+    assert max(r["r"] for r in folded) < min(r["r"] for r in kept), "折叠的必须都在前面"
+    assert all(len(r["p"]) <= 40 for r in tl["rounds"]), "预览按 preview_chars 截断"
+    assert all("【第" in r["p"] for r in tl["rounds"])
+
+    # 只留最新一份：再发一次请求会覆盖，不会越堆越多
+    before = tl["at"]
+    assert post("mm", convo(30) + convo(1, start=99, head=False)).status_code == 200
+    tl2 = httpx.get(f"{PROXY}/admin/session/{cid}/timeline", headers=HEADERS, timeout=5).json()
+    assert tl2["at"] > before and tl2["total_rounds"] == 31
+
+
+# ---- body / header / query 透传与 extra_body ----
+
+def test_body_params_pass_through_untouched():
+    """messages 之外的字段一律原样透传，包括厂商私有字段。"""
+    fresh()
+    extras = {"temperature": 0.7, "top_p": 0.9, "seed": 42, "stop": ["\n\n"],
+              "reasoning_effort": "xhigh", "thinking": {"type": "enabled", "budget_tokens": 8000},
+              "enable_thinking": True, "thinking_budget": 4096,
+              "tools": [{"type": "function", "function": {"name": "f"}}], "tool_choice": "auto",
+              "response_format": {"type": "json_object"}, "user": "u-1",
+              "厂商私有字段": "保留我"}
+    assert post("mm", convo(2), **extras).status_code == 200
+    got = chat_calls()[-1]["extra"]
+    for k, v in extras.items():
+        assert got.get(k) == v, f"{k} 没原样透传: {got.get(k)!r} != {v!r}"
+
+
+def test_extra_body_overrides_client_and_protects_core_fields():
+    fresh()
+    cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    cfg["providers"] = [
+        {"name": "mm", "base_url": f"{MOCK}/v1", "api_key": "sk-up", "multimodal": True,
+         "extra_body": {"reasoning_effort": "xhigh", "temperature": 1.0,
+                        "messages": [{"role": "user", "content": "偷天换日"}], "stream": True}},
+        {"name": "text", "base_url": f"{MOCK}/v1", "api_key": "sk-up", "multimodal": False},
+    ]
+    CFG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    app_module.do_reload()
+
+    assert post("mm", convo(3), temperature=0.2, reasoning_effort="low").status_code == 200
+    c = chat_calls()[-1]
+    assert c["extra"]["reasoning_effort"] == "xhigh", "extra_body 应当覆盖客户端的 low"
+    assert c["extra"]["temperature"] == 1.0
+    # messages / stream 被保护：既没被换掉，也没被强行改成流式
+    assert c["n_messages"] == len(convo(3)) and c["stream"] is False
+    assert "偷天换日" not in json.dumps(c, ensure_ascii=False)
+
+
+def test_summary_model_extra_body_applies():
+    fresh(extra_body={"temperature": 0.5, "enable_thinking": False})
+    assert post("mm", convo(30)).status_code == 200
+    s = summary_calls()[0]
+    assert s["extra"]["temperature"] == 0.5
+    assert s["extra"]["enable_thinking"] is False
+    # 骨架字段不受影响
+    assert s["n_messages"] == 2 and s["stream"] is False
+
+
+def test_headers_are_not_forwarded_unless_whitelisted():
+    fresh()
+    h = {**HEADERS, "anthropic-beta": "interleaved-thinking", "X-Title": "my-app",
+         "Cookie": "secret=1", "X-Forwarded-For": "10.0.0.9"}
+    httpx.post(f"{PROXY}/mm/v1/chat/completions", headers=h, timeout=30,
+               json={"model": "mock-chat", "messages": convo(2)})
+    got = {k.lower(): v for k, v in chat_calls()[-1]["headers"].items()}
+    assert "anthropic-beta" not in got and "x-title" not in got, "默认不该透传"
+    assert got.get("authorization") == "Bearer sk-up", "鉴权头必须换成供应商的 key"
+
+    cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    cfg["providers"][0]["forward_headers"] = ["anthropic-beta", "x-title",
+                                              "authorization", "cookie"]   # 后两个应被拒
+    CFG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    app_module.do_reload()
+
+    httpx.post(f"{PROXY}/mm/v1/chat/completions", headers=h, timeout=30,
+               json={"model": "mock-chat", "messages": convo(2)})
+    got = {k.lower(): v for k, v in chat_calls()[-1]["headers"].items()}
+    assert got.get("anthropic-beta") == "interleaved-thinking"
+    assert got.get("x-title") == "my-app"
+    assert got.get("authorization") == "Bearer sk-up", "白名单里写 authorization 也不能生效"
+    assert "cookie" not in got, "cookie 永远不透传"
+    assert "x-forwarded-for" not in got
+
+
+def test_query_string_forwarding_is_opt_in():
+    fresh()
+    httpx.post(f"{PROXY}/mm/v1/chat/completions?api-version=2024-08-01", headers=HEADERS,
+               timeout=30, json={"model": "mock-chat", "messages": convo(2)})
+    assert chat_calls()[-1]["query"] == "", "默认不透传查询串"
+
+    cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    cfg["providers"][0]["forward_query"] = True
+    CFG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    app_module.do_reload()
+    httpx.post(f"{PROXY}/mm/v1/chat/completions?api-version=2024-08-01", headers=HEADERS,
+               timeout=30, json={"model": "mock-chat", "messages": convo(2)})
+    assert chat_calls()[-1]["query"] == "api-version=2024-08-01"

@@ -100,6 +100,15 @@ def _lock_for(key: str) -> asyncio.Lock:
     return lk
 
 
+def conversation_lock(conv_key: str | None, conv_id: str) -> asyncio.Lock:
+    """给管理接口用：拿到和 prepare() 同一把会话锁。
+
+    prepare() 是在知道 conv_id 之前就要上锁的（上锁才能安全地查会话），
+    所以锁键用的是 conv_key。管理接口只有 conv_id，从会话表里回查 conv_key 即可对上。
+    """
+    return _lock_for(conv_key or f"cid:{conv_id}")
+
+
 # ===== 组装 =====
 def _summary_message(summary_text: str, *, branch_warning: bool) -> dict:
     p = config.prompts()
@@ -320,11 +329,13 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
                      summary_tokens, M.rounds_before(rounds, retain_from) + 1, total_rounds,
                      len(body) - retain_from)
             final = _assemble(head, prev_summary, body[retain_from:])
-            return _finish(final, provider, {**base_meta, "mode": "reuse"}, trigger, t0)
+            return _finish(final, provider, {**base_meta, "mode": "reuse"}, trigger, t0,
+                           rounds=rounds, infos=infos, body=body, total_rounds=total_rounds)
         log.info("[%s] 无需压缩：等效 %d tokens < %d｜共 %d 轮 %d 条原文，原样转发",
                  (conv_id or "new")[:12], effective, trigger, total_rounds, len(body))
         final = _assemble(head, "", body)
-        return _finish(final, provider, {**base_meta, "mode": "passthrough"}, trigger, t0)
+        return _finish(final, provider, {**base_meta, "mode": "passthrough"}, trigger, t0,
+                       rounds=rounds, infos=infos, body=body, total_rounds=total_rounds)
 
     # ---- 超阈值：必须压缩 ----
     if is_fallback:
@@ -355,7 +366,8 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
         log.info("[%s] 等效 %d tokens 超阈值但近期原文仅 %d tokens(<=%d)，复用摘要，保留 %d 条",
                  conv_id[:12], effective, tail_tokens, keep_recent, len(body) - retain_from)
         final = _assemble(head, prev_summary, body[retain_from:])
-        return _finish(final, provider, {**base_meta, "mode": "reuse_over_trigger"}, trigger, t0)
+        return _finish(final, provider, {**base_meta, "mode": "reuse_over_trigger"}, trigger, t0,
+                       rounds=rounds, infos=infos, body=body, total_rounds=total_rounds)
 
     # ---- 开启 / 续接压缩事件 ----
     ck = located.checkpoint
@@ -445,7 +457,7 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
     meta["retained_tokens"] = M.tokens_of(infos, retain_final, len(infos))
     final = _assemble(head, summary_text, body[retain_final:])
     return _finish(final, provider, meta, trigger, t0, rounds=rounds, infos=infos,
-                   keep_from=keep_from, total_rounds=total_rounds)
+                   keep_from=keep_from, total_rounds=total_rounds, body=body)
 
 
 async def _index_anchors(st, conv_id: str, infos: list[M.MsgInfo]) -> None:
@@ -534,12 +546,46 @@ async def _fallback_path(head, body, infos, rounds, cur_sig, key, conv_id, locat
             "retain_from": keep_from,
             "retained_tokens": M.tokens_of(infos, keep_from, len(infos))}
     return _finish(final, provider, meta, trigger, t0, rounds=rounds, infos=infos,
-                   keep_from=keep_from, total_rounds=total_rounds)
+                   keep_from=keep_from, total_rounds=total_rounds, body=body)
+
+
+def build_timeline(body: list[dict], infos: list[M.MsgInfo], rounds: list[tuple[int, int]],
+                   meta: dict[str, Any], provider_name: str) -> dict[str, Any]:
+    """一次请求的结构快照：逐轮的角色、token、预览，以及这一轮是被折叠还是逐字发出。
+
+    **只存结构和预览，不存原文。**存全量 payload 意味着每次请求写几十 MB，
+    小机器上磁盘和 IO 都扛不住，而且那是用户对话的完整副本，落盘本身就是风险。
+    这里每轮约 100 字节，几千轮也就几百 KB，且每个会话只保留最新一份（覆盖写）。
+    """
+    n = int(config.observability().get("preview_chars", 60))
+    retain_from = int(meta.get("retain_from") or meta.get("compressed_upto") or 0)
+    out_rounds = []
+    for r, (s, e) in enumerate(rounds):
+        # 一轮里挑第一条 user 做预览，没有就用这一轮的第一条
+        head = next((body[i] for i in range(s, e) if body[i].get("role") == "user"), body[s])
+        out_rounds.append({
+            "r": r + 1, "s": s, "e": e,
+            "t": M.tokens_of(infos, s, e),
+            "roles": "".join((infos[i].role or "?")[0] for i in range(s, e))[:24],
+            "p": M.message_text(head)[:n],
+            "c": 1 if e <= retain_from else 0,          # 1 = 这一轮已被折叠进摘要
+        })
+    return {
+        "at": time.time(), "provider": provider_name, "mode": meta.get("mode"),
+        "in": {"messages": meta.get("messages"), "tokens": meta.get("raw_tokens")},
+        "out": {"messages": len(meta.get("_final_roles") or []) or None,
+                "tokens": meta.get("final_tokens")},
+        "out_roles": meta.get("_final_roles"),
+        "summary_tokens": meta.get("summary_tokens"),
+        "retain_from": retain_from, "round_upto": meta.get("round_upto"),
+        "total_rounds": len(rounds), "gate_tokens": meta.get("gate_tokens"),
+        "rounds": out_rounds,
+    }
 
 
 def _finish(final: list[dict], provider: dict[str, Any], meta: dict[str, Any],
             trigger: int, t0: float, *, rounds=None, infos=None, keep_from=None,
-            total_rounds=None) -> Prepared:
+            total_rounds=None, body=None) -> Prepared:
     """净化 + 出口闸门。"""
     multimodal = bool(provider.get("multimodal", True))
     final, stats = M.sanitize_for_upstream(final, multimodal)
@@ -585,4 +631,8 @@ def _finish(final: list[dict], provider: dict[str, Any], meta: dict[str, Any],
 
     log.info("转发上游：%d 条消息 / %d tokens（mode=%s，闸门 %d，耗时 %d ms）",
              len(final), final_tokens, meta.get("mode"), gate, meta["elapsed_ms"])
+    if (config.observability().get("capture_timeline") and body is not None
+            and rounds and infos and meta.get("conv_id")):
+        meta["_final_roles"] = [str(m.get("role") or "?") for m in final]
+        meta["_timeline"] = build_timeline(body, infos, rounds, meta, provider.get("name", "?"))
     return Prepared(final, meta)

@@ -78,6 +78,53 @@ case "${1:-status}" in
     [ -z "${2:-}" ] && { echo "用法: $0 session <conv_id 前几位>"; exit 1; }
     _api GET "/admin/session/$2"
     ;;
+  ui-token)
+    python3 -c "import secrets,string; a=string.ascii_letters+string.digits; print(''.join(secrets.choice(a) for _ in range(16)))"
+    echo "把它填进 config.yaml 的 server.ui_token，然后 $0 reload；页面地址 http://<服务器IP>:$PORT/ui" >&2
+    ;;
+  summary)
+    [ -z "${2:-}" ] && { echo "用法: $0 summary <conv_id 前几位>"; exit 1; }
+    curl -s -H "Authorization: Bearer $TOKEN" \
+      "http://127.0.0.1:$PORT/admin/session/$2/summary?format=text"
+    echo
+    ;;
+  edit)
+    # 取回摘要 -> 打开编辑器 -> 存回。带 base_seq 乐观锁，期间发生过压缩会拒绝写入。
+    [ -z "${2:-}" ] && { echo "用法: $0 edit <conv_id 前几位>   （编辑器取 \$EDITOR，默认 vi）"; exit 1; }
+    tmp=$(mktemp -t cproxy-summary-XXXXXX.md)
+    trap 'rm -f "$tmp" "$tmp.orig" "$tmp.meta" "$tmp.json"' EXIT
+    curl -s -H "Authorization: Bearer $TOKEN" \
+      "http://127.0.0.1:$PORT/admin/session/$2/summary" > "$tmp.meta"
+    python3 - "$tmp.meta" "$tmp" <<'PY' || exit 1
+import json, sys
+raw = open(sys.argv[1], encoding="utf-8").read()
+try:
+    d = json.loads(raw)
+except Exception:
+    print("服务返回的不是 JSON：" + raw[:500], file=sys.stderr); sys.exit(1)
+if "summary" not in d:
+    print("取摘要失败：" + json.dumps(d, ensure_ascii=False, indent=2), file=sys.stderr); sys.exit(1)
+open(sys.argv[2], "w", encoding="utf-8").write(d["summary"])
+print("会话 {}｜base_seq={}｜{} tokens（上限 {}）｜已压到第 {}/{} 轮".format(
+    d["conv_id"][:16], d["base_seq"], d["summary_tokens"], d["summary_cap_tokens"],
+    d["round_upto"], d["total_rounds"]), file=sys.stderr)
+if not d.get("editable"):
+    print("⚠️  该会话正在压缩中（事件 seq={}），现在存回会被拒绝".format(
+        d.get("open_event_seq")), file=sys.stderr)
+PY
+    cp "$tmp" "$tmp.orig"
+    "${EDITOR:-vi}" "$tmp"
+    if cmp -s "$tmp" "$tmp.orig"; then echo "内容没有变化，未提交"; exit 0; fi
+    python3 - "$tmp.meta" "$tmp" > "$tmp.json" <<'PY' || exit 1
+import json, sys
+d = json.loads(open(sys.argv[1], encoding="utf-8").read())
+print(json.dumps({"summary": open(sys.argv[2], encoding="utf-8").read(),
+                  "base_seq": d["base_seq"]}, ensure_ascii=False))
+PY
+    curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+      --data-binary @"$tmp.json" \
+      "http://127.0.0.1:$PORT/admin/session/$2/summary" | python3 -m json.tool
+    ;;
   clean)
     [ -z "${2:-}" ] && { echo "用法: $0 clean all | $0 clean <conv_id 前几位>"; exit 1; }
     if [ "$2" = "all" ]; then
@@ -90,7 +137,7 @@ case "${1:-status}" in
   log) tail -f "$LOG" ;;
   errlog) tail -f "$STDERR_LOG" ;;
   *)
-    echo "用法: $0 {start|stop|restart|reload|status|log|errlog|sessions|session <id>|clean all|clean <id>}"
+    echo "用法: $0 {start|stop|restart|reload|status|log|errlog|sessions|session <id>|summary <id>|edit <id>|ui-token|clean all|clean <id>}"
     exit 1
     ;;
 esac

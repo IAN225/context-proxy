@@ -20,6 +20,8 @@ _LOCK = threading.RLock()
 _CONFIG: dict[str, Any] = {}
 _PROVIDERS: dict[str, dict[str, Any]] = {}
 _SECRETS: dict[str, str | None] = {}
+# 页面上保存的提示词覆盖项（来源是数据库，不是 config.yaml）
+_OVERRIDES: dict[str, str] = {}
 
 DEFAULTS: dict[str, Any] = {
     "summary": {
@@ -39,6 +41,7 @@ DEFAULTS: dict[str, Any] = {
         "main_max_attempts": 2,
         "min_output_tokens": 50,
     },
+    "observability": {"capture_timeline": False, "preview_chars": 60},
     "stream": {"smooth_chars": 24, "smooth_delay": 0.008, "flush_backlog_chars": 600},
     "tokenizer": {"encoding": "cl100k_base", "per_message_overhead": 12, "image_tokens": 1100},
     "server": {"host": "0.0.0.0", "port": 8787},
@@ -48,8 +51,7 @@ DEFAULTS: dict[str, Any] = {
 
 FALLBACK_PROMPTS: dict[str, str] = {
     "batch_system": "你是一个对话历史压缩器，请把给到的对话片段压缩成不丢关键信息的结构化要点，禁止编造。",
-    "recompress_chunk": "下面是一份长摘要的一个片段，请只做压缩去冗余，严禁输出任何章节标题。",
-    "recompress_merge": "请把下列摘要材料合并去重，输出唯一一套章节结构的最终摘要，禁止重复章节。",
+    "recompress": "请对下面的摘要做无损精简：删冗余、并同类，保留全部事实与具体值，禁止编造。",
     "injection": "以下是本次对话更早部分的摘要，请当作你自己的记忆继续对话：\n\n{summary}",
     "fallback_notice": "\n\n【重要】用户可能从较早的消息处创建了分支，摘要与后续原文衔接处可能重叠或跳跃，冲突以原文为准。",
 }
@@ -60,6 +62,17 @@ FALLBACK_PROMPTS: dict[str, str] = {
 # 压完一次剩不下多少余量，很快又触发，叠上摘要就顶穿闸门。
 # 所以配置里写多大都没用，实际生效值在这里封顶。
 KEEP_RECENT_MAX_RATIO = 0.5
+
+# 可视化页面密钥的建议长度。短于这个只警告不拦截，但页面能看到全部摘要，别图省事。
+UI_TOKEN_MIN_LEN = 16
+
+# extra_body 里不允许出现的键：改了它们就不是"调参"而是把压缩本身绕过去了。
+PROTECTED_BODY_KEYS = ("messages", "stream")
+
+# forward_headers 永远不放行的头：鉴权头必须换成供应商的 key，
+# 其余几个由 httpx 按实际请求重算，透传过去只会自相矛盾。
+BLOCKED_HEADERS = {"authorization", "host", "content-length", "content-type",
+                   "connection", "transfer-encoding", "cookie", "accept-encoding"}
 
 
 class ConfigError(RuntimeError):
@@ -84,9 +97,14 @@ def _merge_defaults(cfg: dict[str, Any]) -> dict[str, Any]:
             node.setdefault(k, v)
         out[section] = node
     prompts = out["summary"].setdefault("prompts", {}) or {}
+    # 兼容旧配置：二次重压从"分片 + 合并"两套提示词合并成了一套
+    if "recompress" not in prompts and prompts.get("recompress_chunk"):
+        prompts["recompress"] = prompts["recompress_chunk"]
+    for k in ("recompress_chunk", "recompress_merge"):
+        prompts.pop(k, None)
     for k, v in FALLBACK_PROMPTS.items():
         prompts.setdefault(k, v)
-    out["summary"]["prompts"] = prompts
+    out["summary"]["prompts"] = {k: v for k, v in prompts.items() if k in FALLBACK_PROMPTS}
     fb = out["summary"].get("fallback")
     if not isinstance(fb, dict):
         fb = {}
@@ -120,8 +138,43 @@ def _load_providers(cfg: dict[str, Any], warn) -> dict[str, dict[str, Any]]:
             "timeout_seconds": p.get("timeout_seconds", 300),
             "connect_timeout_seconds": p.get("connect_timeout_seconds", 30),
             "multimodal": bool(p.get("multimodal", True)),
+            "extra_body": _clean_extra_body(p.get("extra_body"), f"provider {name!r}", warn),
+            "forward_headers": _clean_headers(p.get("forward_headers"), f"provider {name!r}", warn),
+            "forward_query": bool(p.get("forward_query", False)),
         }
     return providers
+
+
+def _clean_extra_body(raw: Any, who: str, warn) -> dict[str, Any]:
+    """校验 extra_body：必须是映射，且不许覆盖 messages / stream。"""
+    if not raw:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{who} 的 extra_body 必须是一个映射")
+    out = dict(raw)
+    for k in PROTECTED_BODY_KEYS:
+        if k in out:
+            warn("%s 的 extra_body 里的 %r 会被忽略：改它等于绕过压缩/破坏流式处理", who, k)
+            out.pop(k)
+    return out
+
+
+def _clean_headers(raw: Any, who: str, warn) -> list[str]:
+    """校验 forward_headers 白名单，剔除永远不该透传的头。"""
+    if not raw:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError(f"{who} 的 forward_headers 必须是一个列表")
+    out = []
+    for h in raw:
+        h = str(h).strip().lower()
+        if not h:
+            continue
+        if h in BLOCKED_HEADERS:
+            warn("%s 的 forward_headers 里的 %r 会被忽略（鉴权/传输层的头不能透传）", who, h)
+            continue
+        out.append(h)
+    return out
 
 
 def reload(warn=lambda *a, **k: None) -> dict[str, Any]:
@@ -141,7 +194,12 @@ def reload(warn=lambda *a, **k: None) -> dict[str, Any]:
         "summary_fallback": _resolve_secret("SUMMARY_FALLBACK_API_KEY",
                                             cfg["summary"]["fallback"].get("api_key")),
         "auth": _resolve_secret("PROXY_AUTH_TOKEN", cfg["server"].get("auth_token")),
+        "ui": _resolve_secret("PROXY_UI_TOKEN", cfg["server"].get("ui_token")),
     }
+    if secrets["ui"] and len(secrets["ui"]) < UI_TOKEN_MIN_LEN:
+        warn("server.ui_token 只有 %d 位，建议至少 %d 位——这个页面能看到全部对话摘要，"
+             "而且往往开在公网端口上（用 ./ctl.sh ui-token 生成一个）",
+             len(secrets["ui"]), UI_TOKEN_MIN_LEN)
     with _LOCK:
         global _CONFIG, _PROVIDERS, _SECRETS
         _CONFIG, _PROVIDERS, _SECRETS = cfg, providers, secrets
@@ -174,7 +232,38 @@ def keep_recent_tokens() -> int:
 
 
 def prompts() -> dict[str, str]:
-    return _CONFIG["summary"]["prompts"]
+    """生效的提示词 = config.yaml 的值，被页面上保存的覆盖项盖住。
+
+    覆盖项存在数据库里而不是回写 config.yaml——回写会把文件里的注释和排版冲掉，
+    而这份配置的注释本身就是文档。想恢复成文件里的值，删掉覆盖项即可。
+    """
+    base = dict(_CONFIG["summary"]["prompts"])
+    base.update({k: v for k, v in _OVERRIDES.items() if k in FALLBACK_PROMPTS and v})
+    return base
+
+
+def prompt_sources() -> dict[str, dict[str, Any]]:
+    """给页面用：每条提示词的文件值、覆盖值、当前生效值。"""
+    file_vals = _CONFIG["summary"]["prompts"]
+    return {k: {"effective": _OVERRIDES.get(k) or file_vals.get(k, FALLBACK_PROMPTS[k]),
+                "from_file": file_vals.get(k, FALLBACK_PROMPTS[k]),
+                "overridden": bool(_OVERRIDES.get(k))}
+            for k in FALLBACK_PROMPTS}
+
+
+def set_prompt_overrides(overrides: dict[str, str]) -> None:
+    with _LOCK:
+        _OVERRIDES.clear()
+        _OVERRIDES.update({k: v for k, v in (overrides or {}).items()
+                           if k in FALLBACK_PROMPTS and isinstance(v, str) and v.strip()})
+
+
+def prompt_overrides() -> dict[str, str]:
+    return dict(_OVERRIDES)
+
+
+def observability() -> dict[str, Any]:
+    return _CONFIG["observability"]
 
 
 def stream_cfg() -> dict[str, Any]:
@@ -197,6 +286,16 @@ def auth_token() -> str | None:
     return _SECRETS.get("auth")
 
 
+def ui_token() -> str | None:
+    """可视化页面的独立密钥。留空 = 不启用页面（/ui 直接 404）。
+
+    刻意和 server.auth_token 分开：那个要填进 chatbox、会跟着每个对话请求走，
+    拿它当管理后台密码等于把后台钥匙散出去。ui_token 只能访问 /admin/*，
+    不能拿去调 /chat/completions。
+    """
+    return _SECRETS.get("ui")
+
+
 def summary_endpoints() -> list[dict[str, Any]]:
     """返回摘要模型调用链：[主, 备]。缺配置的条目会被过滤掉。"""
     s = summary()
@@ -208,6 +307,7 @@ def summary_endpoints() -> list[dict[str, Any]]:
             "api_key": _SECRETS["summary"],
             "model": s["model"],
             "max_attempts": max(1, int(s.get("main_max_attempts", 2))),
+            "extra_body": _clean_extra_body(s.get("extra_body"), "summary", lambda *a: None),
         })
     fb = s.get("fallback") or {}
     if fb.get("enabled") and fb.get("base_url") and _SECRETS.get("summary_fallback") and fb.get("model"):
@@ -216,7 +316,9 @@ def summary_endpoints() -> list[dict[str, Any]]:
             "base_url": str(fb["base_url"]).rstrip("/"),
             "api_key": _SECRETS["summary_fallback"],
             "model": fb["model"],
-            "max_attempts": max(1, int(fb.get("max_attempts", 3))),
+            # 备用模型没写 extra_body 就沿用主模型的（通常两边想关的思考是同一套）
+            "extra_body": _clean_extra_body(fb.get("extra_body", s.get("extra_body")),
+                                            "summary.fallback", lambda *a: None),
         })
     return out
 

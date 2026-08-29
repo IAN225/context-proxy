@@ -76,7 +76,10 @@ def _extract_text(data: dict) -> tuple[str, str]:
 
 async def _one_call(ep: dict[str, Any], system_prompt: str, user_prompt: str,
                     max_tokens: int, timeout_s: float) -> str:
+    # extra_body 先铺底，再让本函数的固定字段覆盖它——
+    # model / max_tokens 由摘要配置决定，messages / stream 是这条调用链的骨架，都不接受改写。
     payload = {
+        **(ep.get("extra_body") or {}),
         "model": ep["model"],
         "max_tokens": max_tokens,
         "stream": False,
@@ -203,21 +206,6 @@ async def summarize_batch(batch: list[dict], depth: int = 0) -> tuple[str, str]:
         return (left.rstrip() + "\n\n" + right.lstrip()), (m1 if m1 == m2 else f"{m1}+{m2}")
 
 
-async def _condense_chunk(text: str, depth: int = 0) -> tuple[str, str]:
-    s = config.summary()
-    try:
-        return await call_chain(config.prompts()["recompress_chunk"],
-                                "以下是长摘要的一个片段，请按要求精简：\n\n" + text,
-                                int(s.get("summary_max_tokens", 2400)), label="二次重压-分片精简")
-    except _CallError as e:
-        if e.kind != "context" or depth >= 3:
-            raise SummaryFailure("context", f"二次重压分片仍超上下文：{e.message}")
-        half = len(text) // 2
-        a, m1 = await _condense_chunk(text[:half], depth + 1)
-        b, m2 = await _condense_chunk(text[half:], depth + 1)
-        return a.rstrip() + "\n\n" + b.lstrip(), (m1 if m1 == m2 else f"{m1}+{m2}")
-
-
 def _split_by_tokens(text: str, limit: int) -> list[str]:
     """按段落边界切成不超过 limit token 的片段，保持原顺序。"""
     paras = [p for p in re.split(r"\n{2,}", text) if p.strip()]
@@ -237,43 +225,45 @@ def _split_by_tokens(text: str, limit: int) -> list[str]:
 
 
 async def recompress(long_summary: str, on_progress: Callable | None = None) -> tuple[str, str, int]:
-    """累积摘要的二次重压。返回 (新摘要, 模型标识, 分片数)。
+    """累积摘要的二次重压：**和批次摘要同构**——按阈值分批，每批一次调用，系统拼接。
 
-    坑点：摘要 prompt 要求输出固定章节结构，如果按 token 硬切成 N 批分别精简，
-    每批都会各自生成一整套章节，合并后出现 N 份重复且互相矛盾的同名章节。
-    所以分片阶段用**禁止输出章节标题**的 ``recompress_chunk`` 提示词，
-    最后再用 ``recompress_merge`` 统一成一份章节结构。
+    早先这里是两段式（分片用"禁止输出章节标题"的提示词精简，再调一次模型合并成稿），
+    实际用下来太零散：多一次调用、多一套提示词，产出还不见得更好。现在统一成
+    「按 ``summary_batch_tokens`` 切片 → 每片用同一套 ``prompts.recompress`` 精简
+    → 系统直接用空行拼接」，和普通压缩累积摘要的方式完全一致。
     """
     s = config.summary()
-    batch_limit = int(s.get("summary_batch_tokens", 10000))
-    cap = int(s.get("summary_total_cap_tokens", 12800))
-    chunks = _split_by_tokens(long_summary, batch_limit)
+    chunks = _split_by_tokens(long_summary, int(s.get("summary_batch_tokens", 10000)))
+    before = M.text_tokens(long_summary)
+    if len(chunks) > 1:
+        log.info("二次重压：累积摘要 %d tokens，按阈值分 %d 片，逐片精简后拼接", before, len(chunks))
 
-    if len(chunks) == 1:
-        text, who = await call_chain(
-            config.prompts()["recompress_merge"],
-            "以下是需要合并精简的摘要材料：\n\n" + long_summary,
-            max(512, cap // 2), label="二次重压-单片")
-        return text, who, 1
-
-    log.info("二次重压：累积摘要 %d tokens，分 %d 片精简后再统一合并",
-             M.text_tokens(long_summary), len(chunks))
-    condensed: list[str] = []
+    out: list[str] = []
     models: set[str] = set()
     for i, ch in enumerate(chunks):
         if on_progress:
             await on_progress(i + 1, len(chunks))
-        text, who = await _condense_chunk(ch)
-        condensed.append(text)
+        text, who = await _condense(ch)
+        out.append(text.strip())
         models.add(who)
-        log.info("二次重压：第 %d/%d 片完成（%d -> %d tokens，模型 %s）",
-                 i + 1, len(chunks), M.text_tokens(ch), M.text_tokens(text), who)
-    merged_input = "\n\n".join(condensed)
-    if on_progress:
-        await on_progress(len(chunks), len(chunks))
-    final, who = await call_chain(
-        config.prompts()["recompress_merge"],
-        "以下是同一段历史的若干个已精简片段，按时间先后拼接，请合并成唯一一套章节：\n\n" + merged_input,
-        max(512, cap // 2), label="二次重压-合并成稿")
-    models.add(who)
-    return final, "+".join(sorted(models)), len(chunks)
+        if len(chunks) > 1:
+            log.info("二次重压：第 %d/%d 片完成（%d -> %d tokens，模型 %s）",
+                     i + 1, len(chunks), M.text_tokens(ch), M.text_tokens(text), who)
+    return "\n\n".join(x for x in out if x), "+".join(sorted(models)), len(chunks)
+
+
+async def _condense(text: str, depth: int = 0) -> tuple[str, str]:
+    s = config.summary()
+    try:
+        return await call_chain(config.prompts()["recompress"],
+                                "以下是需要精简的摘要内容：\n\n" + text,
+                                int(s.get("summary_max_tokens", 2400)),
+                                label=f"二次重压({M.text_tokens(text)} tokens)")
+    except _CallError as e:
+        if e.kind != "context" or depth >= 3:
+            raise SummaryFailure("context", f"二次重压分片仍超出上下文：{e.message}")
+        half = len(text) // 2
+        log.warning("二次重压分片超上下文，二分重投（第 %d 层）", depth + 1)
+        a, m1 = await _condense(text[:half], depth + 1)
+        b, m2 = await _condense(text[half:], depth + 1)
+        return a.rstrip() + "\n\n" + b.lstrip(), (m1 if m1 == m2 else f"{m1}+{m2}")

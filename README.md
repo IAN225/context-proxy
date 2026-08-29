@@ -75,6 +75,44 @@ chmod +x ctl.sh && ./ctl.sh start     # 本地调试用；长期运行请用下�
 `<provider>` 换成 `config.yaml` 里配的任意 `name`。每个供应商一个独立 URL，
 保存后 chatbox 会自动从 `/<provider>/v1/models` 拉到模型列表。
 
+### 参数怎么传给上游
+
+`messages` 之外的 body 字段**一律原样透传**——`temperature`、`top_p`、`seed`、`tools`、
+`response_format`、各家的思考开关，以及任何厂商私有字段，代理都不认识也不改动，
+所以将来出现的新参数自动就支持。
+
+想强制某个 chatbox 界面上表达不了的参数（比如思考强度），用 `extra_body`：
+
+```yaml
+providers:
+  - name: <provider>
+    extra_body:                    # 会覆盖客户端发来的同名字段
+      reasoning_effort: "xhigh"
+
+summary:
+  extra_body:                      # 摘要模型通常配得正好相反：不思考、低温
+    temperature: 0.5
+    enable_thinking: false
+```
+
+> ⚠️ 思考开关的字段名各家不同（`reasoning_effort` / `thinking` / `enable_thinking` …），
+> 写了上游不认识的字段有些网关会直接 400。config.yaml 里几种写法都列了并注释掉，
+> **只留你的供应商确实支持的那一行**，改完先发一条消息验证。
+> `messages` 和 `stream` 不接受改写（改了等于绕过压缩、破坏流式处理），写了会被忽略并告警。
+
+请求头默认**不透传**（无脑转发会把 cookie、`x-forwarded-for` 一起漏给上游），
+需要哪个按名字白名单放行；查询串同理：
+
+```yaml
+providers:
+  - name: <provider>
+    forward_headers: ["anthropic-beta", "http-referer", "x-title"]
+    forward_query: true            # Azure OpenAI 的 ?api-version= 需要
+```
+
+`Authorization` 永远由代理换成该 provider 的 `api_key`（客户端发来的是代理的 token），
+写进白名单也不会生效。
+
 ---
 
 ## 长期运行：systemd
@@ -136,9 +174,80 @@ systemctl status context-proxy
 ./ctl.sh reload              # 热重载 config.yaml（除 tokenizer.encoding 外全部字段都能热改）
 ./ctl.sh log                 # 实时日志
 ./ctl.sh sessions            # 所有会话的压缩进度
-./ctl.sh session <id前几位>   # 某会话的全部 checkpoint 与摘要全文
+./ctl.sh session <id前几位>   # 某会话的全部 checkpoint（摘要只给预览）
+./ctl.sh summary <id前几位>   # 打印当前生效的摘要全文
+./ctl.sh edit <id前几位>      # 用 $EDITOR 直接改摘要（见下节）
 ./ctl.sh clean <id前几位>     # 清除某会话（下次从头重压）
 ./ctl.sh clean all           # 清除全部（需二次确认）
+```
+
+## 可视化页面
+
+想在浏览器里看和改，先设一个登录密钥（和 chatbox 用的 `auth_token` 是两把钥匙）：
+
+```bash
+./ctl.sh ui-token                 # 生成 16 位随机密钥
+# 填进 config.yaml 的 server.ui_token，然后
+./ctl.sh reload
+```
+
+打开 `http://<服务器IP>:8787/ui` 输入密钥即可。**按手机优先做的**，
+在手机上是卡片流而不是宽表格，点击目标够大，输入框不会触发 iOS 自动放大。
+
+两个页签：
+
+- **会话** —— 列表与压缩进度、checkpoint 链、当前生效的摘要全文（可直接编辑保存），
+  以及本次请求的「进来 → 发出去」对比和对话时间轴（见下）。
+- **提示词** —— 四套提示词直接在页面上改、保存、一键恢复成 config.yaml 里的值。
+  改动存进数据库当覆盖项，**不回写 config.yaml**（回写会把文件里的注释冲掉）。
+
+安全上：
+
+- **`ui_token` 留空 = 页面整个不存在**（`/ui` 返回 404），不会不小心把后台裸奔在公网上；
+- 它**只能访问 `/admin/*`，不能用来调 `/chat/completions`**——和 `auth_token` 互不通用；
+- 密钥只存在浏览器的 sessionStorage 里，关掉标签页就没了；
+- 页面零外部依赖（不引 CDN），断网 / 内网机器都能打开；
+- 连续输错 10 次会被限流。
+
+> 这个页面能看到全部对话摘要。别用弱密钥，也建议只在内网、或加了 HTTPS 的反代后面开放。
+
+### 对话时间轴（默认关闭）
+
+想看「这次请求哪些轮次被折叠进摘要了、上游最终收到多少」，把
+`observability.capture_timeline` 设为 `true` 再 `reload`。之后每次请求会存一份**结构快照**：
+逐轮的 token、角色、首条消息预览，以及这一轮是折叠还是逐字发出。页面上就有一条
+折叠区在上、原文区在下、中间一道分隔线的时间轴。
+
+**只存结构与预览，不存原文**——存全量 payload 每次请求要写几十 MB，小机器扛不住，
+也没必要把对话副本再落一份盘。实测开销：4000 条的会话每请求约 +18 ms（构建 13 + 落盘 5），
+快照约 460 KB，且每个会话**只留最新一份**（覆盖写），不随请求数增长。不看就关掉，零开销。
+
+## 摘要不满意？手动改
+
+摘要模型压出来的东西不好使时，可以直接改，改完下一次请求就生效：
+
+```bash
+./ctl.sh sessions                 # 找到 conv_id
+./ctl.sh summary a1b2c3d4         # 先看看现在是什么
+EDITOR=nano ./ctl.sh edit a1b2c3d4   # 拉到编辑器里改，保存即写回
+```
+
+改动会写成一条新的 `manual` checkpoint，**原来那条留在链上可以回退**；位置信息
+（压到第几轮、指纹数组）整套沿用，不影响定位。后续压缩会在你写的内容**之后追加**，
+不会覆盖掉。
+
+几条保护：
+
+- 摘要正被压缩事件占用时拒绝写入（提示等这轮压完），避免和压缩交错写；
+- 带 `base_seq` 乐观锁，取回之后如果又压过一次，写回会被拒绝，不会覆盖新压出来的内容；
+- 超过 `summary_total_cap_tokens` 拒绝保存——否则下次会触发二次重压把你的改动洗掉。
+
+除了上面的[可视化页面](#可视化页面)，也可以直接调接口接自己的界面：
+
+```
+GET  /admin/session/{conv_id}/summary            # JSON，含 base_seq / token 数 / 是否可编辑
+GET  /admin/session/{conv_id}/summary?format=text # 纯文本
+PUT  /admin/session/{conv_id}/summary            # {"summary": "...", "base_seq": N}
 ```
 
 `/health` 里有几个值得盯的字段：
@@ -169,7 +278,8 @@ cproxy/store.py       SQLite：会话、checkpoint、指纹倒排、旧库迁移
 cproxy/locate.py      会话匹配与分支点检测
 cproxy/summarizer.py  摘要模型调用：重试分类、fallback、二次重压
 cproxy/compress.py    压缩主流程
-cproxy/app.py         路由、流式转发、管理接口
+cproxy/app.py         路由、鉴权、流式转发、管理接口
+cproxy/ui.py          内嵌的可视化页面（单文件，零外部依赖）
 config.yaml           配置（含四套提示词）
 ctl.sh                管理脚本
 tests/                单测 + 端到端测试（假上游）

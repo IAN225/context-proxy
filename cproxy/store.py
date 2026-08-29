@@ -69,6 +69,14 @@ CREATE TABLE IF NOT EXISTS fp_index (
 CREATE INDEX IF NOT EXISTS idx_fp_conv ON fp_index(conv_id);
 
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
+
+-- 每个会话只留**最新一份**请求快照（覆盖写），供页面画时间轴。
+-- 只存结构与预览，不存原文；默认不开，见 observability.capture_timeline。
+CREATE TABLE IF NOT EXISTS timelines (
+    conv_id    TEXT PRIMARY KEY,
+    payload    TEXT NOT NULL,
+    updated_at REAL NOT NULL
+) WITHOUT ROWID;
 """
 
 
@@ -268,16 +276,79 @@ class Store:
                 row = self._conn.execute("SELECT conv_id FROM checkpoints WHERE id = ?",
                                          (ckpt_id,)).fetchone()
                 if row:
-                    conv_id = row["conv_id"]
-                    # 保留：置顶的最早一条 + 最近 keep 个压缩事件（按事件计，不按批次）
-                    self._conn.execute(
-                        "DELETE FROM checkpoints WHERE conv_id = ? AND pinned = 0 AND seq NOT IN "
-                        "(SELECT seq FROM checkpoints WHERE conv_id = ? ORDER BY seq DESC LIMIT ?)",
-                        (conv_id, conv_id, keep))
+                    self._prune(row["conv_id"], keep)
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def _get_meta_sync(self, k: str) -> str | None:
+        rows = self._q("SELECT v FROM meta WHERE k = ?", (k,))
+        return rows[0]["v"] if rows else None
+
+    def _set_meta_sync(self, k: str, v: str) -> None:
+        self._x("INSERT OR REPLACE INTO meta (k, v) VALUES (?, ?)", (k, v))
+
+    def _save_timeline_sync(self, conv_id: str, payload: str) -> None:
+        self._x("INSERT OR REPLACE INTO timelines (conv_id, payload, updated_at) VALUES (?,?,?)",
+                (conv_id, payload, time.time()))
+
+    def _load_timeline_sync(self, conv_id: str) -> dict | None:
+        rows = self._q("SELECT payload, updated_at FROM timelines WHERE conv_id = ?", (conv_id,))
+        if not rows:
+            return None
+        d = json.loads(rows[0]["payload"])
+        d["updated_at"] = rows[0]["updated_at"]
+        return d
+
+    def _prune(self, conv_id: str, keep: int) -> None:
+        """保留：置顶的最早一条 + 最近 keep 个压缩事件（按事件计，不按批次）。调用方负责事务。"""
+        assert self._conn is not None
+        self._conn.execute(
+            "DELETE FROM checkpoints WHERE conv_id = ? AND pinned = 0 AND seq NOT IN "
+            "(SELECT seq FROM checkpoints WHERE conv_id = ? ORDER BY seq DESC LIMIT ?)",
+            (conv_id, conv_id, keep))
+
+    def _latest_ckpt_sync(self, conv_id: str) -> dict | None:
+        rows = self._q("SELECT * FROM checkpoints WHERE conv_id = ? ORDER BY seq DESC, id DESC LIMIT 1",
+                       (conv_id,))
+        return _row_to_ckpt(rows[0]) if rows else None
+
+    def _open_event_ckpt_sync(self, conv_id: str) -> dict | None:
+        rows = self._q("SELECT * FROM checkpoints WHERE conv_id = ? AND status = 'partial' "
+                       "ORDER BY seq DESC LIMIT 1", (conv_id,))
+        return _row_to_ckpt(rows[0]) if rows else None
+
+    def _add_manual_sync(self, conv_id: str, base_id: int, summary: str, keep: int) -> int:
+        """把手工编辑的摘要写成**新的** checkpoint，不覆盖原来那条。
+
+        位置信息（compressed_upto / round_upto / signature / …）整套从被编辑的那条复制过来——
+        用户只改了摘要文字，历史对齐关系没有变。原checkpoint 留在链上，改坏了可以回退。
+        """
+        now = time.time()
+        with self._lock:
+            assert self._conn is not None
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                cur = self._conn.execute(
+                    "SELECT event_seq FROM conversations WHERE conv_id = ?", (conv_id,)).fetchone()
+                seq = (cur["event_seq"] if cur else 0) + 1
+                self._conn.execute(
+                    "INSERT INTO checkpoints (conv_id, seq, status, kind, pinned, summary, "
+                    "compressed_upto, round_upto, total_rounds, msg_count, signature, legacy_fp, "
+                    "created_at, updated_at) "
+                    "SELECT conv_id, ?, 'sealed', 'manual', 0, ?, compressed_upto, round_upto, "
+                    "total_rounds, msg_count, signature, legacy_fp, ?, ? "
+                    "FROM checkpoints WHERE id = ?", (seq, summary, now, now, base_id))
+                self._conn.execute(
+                    "UPDATE conversations SET event_seq = ?, updated_at = ?, last_mode = 'manual' "
+                    "WHERE conv_id = ?", (seq, now, conv_id))
+                self._prune(conv_id, keep)
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return seq
 
     def _index_fps_sync(self, conv_id: str, fps: list[str], indexed_upto: int) -> None:
         if not fps:
@@ -335,6 +406,7 @@ class Store:
                 for cid in conv_ids:
                     self._conn.execute("DELETE FROM checkpoints WHERE conv_id = ?", (cid,))
                     self._conn.execute("DELETE FROM fp_index WHERE conv_id = ?", (cid,))
+                    self._conn.execute("DELETE FROM timelines WHERE conv_id = ?", (cid,))
                     self._conn.execute("DELETE FROM conversations WHERE conv_id = ?", (cid,))
                 self._conn.commit()
             except Exception:
@@ -438,11 +510,33 @@ class Store:
                    total_rounds: int, keep: int) -> None:
         await self._call(self._seal_sync, ckpt_id, signature, msg_count, total_rounds, keep)
 
+    async def latest_checkpoint(self, conv_id: str) -> dict | None:
+        return await self._call(self._latest_ckpt_sync, conv_id)
+
+    async def open_event_checkpoint(self, conv_id: str) -> dict | None:
+        return await self._call(self._open_event_ckpt_sync, conv_id)
+
+    async def add_manual_checkpoint(self, conv_id: str, base_id: int, summary: str,
+                                    keep: int) -> int | None:
+        return await self._call(self._add_manual_sync, conv_id, base_id, summary, keep)
+
     async def index_fps(self, conv_id: str, fps: list[str], indexed_upto: int) -> None:
         await self._call(self._index_fps_sync, conv_id, fps, indexed_upto)
 
     async def bump_fallback(self, conv_id: str) -> int:
         return await self._call(self._bump_fallback_sync, conv_id) or 0
+
+    async def get_meta(self, k: str) -> str | None:
+        return await self._call(self._get_meta_sync, k)
+
+    async def set_meta(self, k: str, v: str) -> None:
+        await self._call(self._set_meta_sync, k, v)
+
+    async def save_timeline(self, conv_id: str, payload: str) -> None:
+        await self._call(self._save_timeline_sync, conv_id, payload)
+
+    async def load_timeline(self, conv_id: str) -> dict | None:
+        return await self._call(self._load_timeline_sync, conv_id)
 
     async def stats(self) -> dict:
         return await self._call(self._stats_sync) or {}
