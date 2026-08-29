@@ -24,7 +24,18 @@ STATE = {
     "calls": [],             # 记录每次收到的请求
     "summary_calls": 0,
     "summary_text": None,    # 固定摘要文本（None = 自动生成）
+    "strict_body": False,    # true = 遇到白名单外的 body 字段返回 400（模拟严格网关）
+    "strict_message": "Unrecognized request argument supplied: {fields}",
+    "reasoning_for": [],     # 命中这些 body 字段时在响应里带上思考内容
+    "chat_status": 0,        # 非 0 = 对话请求返回这个状态（模拟 key 错、端点挂了）
+    "chat_status_after": 0,  # chat_status 从第几次对话请求开始生效（0 = 从第一次就生效）
+    "field_status": {},      # {body 字段名: 状态码}，命中就返回该状态（模拟限流打在某个探针上）
+    "field_status_once": False,   # true = field_status 只生效一次（用来验证重试）
 }
+
+# 严格模式下允许出现的 body 字段
+KNOWN_BODY_KEYS = {"model", "messages", "stream", "max_tokens", "temperature", "top_p",
+                   "seed", "presence_penalty", "frequency_penalty", "stop", "user"}
 
 app = FastAPI()
 
@@ -43,17 +54,27 @@ async def calls():
 @app.post("/__reset")
 async def reset():
     STATE.update({"fail_next": 0, "fail_after": -1, "fail_status": 500, "short_next": 0,
-                  "calls": [], "summary_calls": 0, "summary_text": None})
+                  "calls": [], "summary_calls": 0, "summary_text": None,
+                  "strict_body": False, "reasoning_for": [], "chat_status": 0,
+                  "chat_status_after": 0,
+                  "field_status": {}, "field_status_once": False,
+                  "strict_message": "Unrecognized request argument supplied: {fields}"})
     return {"ok": True}
 
 
 @app.get("/v1/models")
 async def models():
-    return {"object": "list", "data": [{"id": "mock-chat"}, {"id": "mock-summary"}]}
+    return {"object": "list", "data": [{"id": "mock-chat"}, {"id": "mock-summary"},
+                                      {"id": "mock-summary-backup"}]}
 
 
 def _is_summary(body: dict) -> bool:
     return str(body.get("model", "")).startswith("mock-summary")
+
+
+def _is_backup(body: dict) -> bool:
+    """备用摘要模型：失败注入只作用于主模型，备用永远成功，方便断言"切过去了"。"""
+    return str(body.get("model", "")) == "mock-summary-backup"
 
 
 @app.post("/v1/chat/completions")
@@ -85,9 +106,33 @@ async def chat(request: Request):
         "query": str(request.url.query),
     })
 
+    if STATE["chat_status"] and not _is_summary(body):
+        n_chat = sum(1 for c in STATE["calls"] if not str(c["model"]).startswith("mock-summary"))
+        if n_chat >= max(1, int(STATE["chat_status_after"])):
+            return JSONResponse(status_code=STATE["chat_status"],
+                                content={"error": {"message": "upstream says no"}})
+
+    for field, status in list(STATE["field_status"].items()):
+        if field in body:
+            if STATE["field_status_once"]:
+                STATE["field_status"].pop(field, None)
+            return JSONResponse(status_code=int(status),
+                                content={"error": {"message": f"transient on {field}"}})
+
+    if STATE["strict_body"]:
+        unknown = [k for k in body if k not in KNOWN_BODY_KEYS]
+        if unknown:
+            return JSONResponse(status_code=400, content={"error": {
+                "message": STATE["strict_message"].format(fields=", ".join(unknown)),
+                "type": "invalid_request_error"}})
+
+    hit = [k for k in STATE["reasoning_for"] if k in body]
+
     if _is_summary(body):
         STATE["summary_calls"] += 1
         exhausted = 0 <= STATE["fail_after"] < STATE["summary_calls"]
+        if _is_backup(body):
+            return _completion(STATE["summary_text"] or _fake_summary(msgs))
         if STATE["fail_next"] > 0 or exhausted:
             if STATE["fail_next"] > 0:
                 STATE["fail_next"] -= 1
@@ -101,6 +146,8 @@ async def chat(request: Request):
         return _completion(text)
 
     reply = "好的，我记住了。" * 20
+    if hit and not body.get("stream"):
+        return _completion(reply, reasoning="让我想想……" * 3)
     if body.get("stream"):
         return StreamingResponse(_sse(reply, body.get("model", "mock-chat")),
                                  media_type="text/event-stream")
@@ -114,12 +161,16 @@ def _fake_summary(msgs: list[dict]) -> str:
             f"- 覆盖片段 #{len(user) % 997}，保留数值 12345 与名称 Alpha。")
 
 
-def _completion(text: str) -> JSONResponse:
+def _completion(text: str, reasoning: str = "") -> JSONResponse:
+    msg = {"role": "assistant", "content": text}
+    usage = {"prompt_tokens": 1, "completion_tokens": 1}
+    if reasoning:
+        msg["reasoning_content"] = reasoning
+        usage["completion_tokens_details"] = {"reasoning_tokens": len(reasoning)}
     return JSONResponse({
         "id": "cmpl-mock", "object": "chat.completion", "model": "mock",
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text},
-                     "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        "choices": [{"index": 0, "message": msg, "finish_reason": "stop"}],
+        "usage": usage,
     })
 
 

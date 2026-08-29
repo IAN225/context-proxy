@@ -553,12 +553,18 @@ def build_timeline(body: list[dict], infos: list[M.MsgInfo], rounds: list[tuple[
                    meta: dict[str, Any], provider_name: str) -> dict[str, Any]:
     """一次请求的结构快照：逐轮的角色、token、预览，以及这一轮是被折叠还是逐字发出。
 
-    **只存结构和预览，不存原文。**存全量 payload 意味着每次请求写几十 MB，
-    小机器上磁盘和 IO 都扛不住，而且那是用户对话的完整副本，落盘本身就是风险。
+    **只存结构 + 每轮开头 preview_chars 字（默认 60）的预览，不存完整原文。**
+    存全量 payload 意味着每次请求写几十 MB，小机器上磁盘和 IO 都扛不住，
+    而且那是用户对话的完整副本，落盘本身就是风险。注意预览是未脱敏的真实片段。
     这里每轮约 100 字节，几千轮也就几百 KB，且每个会话只保留最新一份（覆盖写）。
     """
     n = int(config.observability().get("preview_chars", 60))
-    retain_from = int(meta.get("retain_from") or meta.get("compressed_upto") or 0)
+    # 显式判 None：retain_from 合法取 0（还没压过 / 已回退到全量原文），
+    # 用 or 会把 0 当缺失，误退回 compressed_upto，时间轴上就会多标一段"已压缩"
+    rf = meta.get("retain_from")
+    if rf is None:
+        rf = meta.get("compressed_upto")
+    retain_from = int(rf or 0)
     out_rounds = []
     for r, (s, e) in enumerate(rounds):
         # 一轮里挑第一条 user 做预览，没有就用这一轮的第一条

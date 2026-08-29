@@ -118,14 +118,22 @@ def _bearer(request: Request) -> str:
     return auth[7:].strip() if auth.lower().startswith("bearer ") else auth.strip()
 
 
-def _check_auth(request: Request, *, admin: bool = False) -> JSONResponse | None:
-    """对话接口只认 auth_token；管理接口额外接受 ui_token。
+def _accepted_tokens(admin: bool) -> list[str]:
+    """列出该类接口认可的密钥。
 
-    两者刻意分开：auth_token 要填进 chatbox、跟着每个对话请求走，
-    拿它当后台密码等于把后台钥匙散出去。
+    对话接口（admin=False）永远只认 auth_token。
+    管理接口：**配了 ui_token 就只认 ui_token**，auth_token 一并失效——
+    auth_token 要填进 chatbox、跟着每个对话请求走，还能开后台等于把后台钥匙散出去。
+    没配 ui_token 时（页面本身也是关的）才退回 auth_token，否则 ./ctl.sh 没法调管理接口。
     """
-    accepted = [t for t in ([config.auth_token()] +
-                            ([config.ui_token()] if admin else [])) if t]
+    if admin:
+        ui = config.ui_token()
+        return [ui] if ui else [t for t in [config.auth_token()] if t]
+    return [t for t in [config.auth_token()] if t]
+
+
+def _check_auth(request: Request, *, admin: bool = False) -> JSONResponse | None:
+    accepted = _accepted_tokens(admin)
     if not accepted:
         return None
     ip = _client_ip(request)
@@ -133,8 +141,10 @@ def _check_auth(request: Request, *, admin: bool = False) -> JSONResponse | None
         return JSONResponse(status_code=429, content={"error": {
             "message": "密钥错误次数过多，请稍后再试", "type": "auth_error"}})
     got = _bearer(request)
-    # compare_digest 防时序侧信道；两个都比一遍，不因为先匹配到就早退
-    if any(hmac.compare_digest(got, t) for t in accepted):
+    # compare_digest 防时序侧信道。any() 会短路，所以先把每个都比完再看结果，
+    # 让耗时不随"第几个才匹配上"变化。
+    results = [hmac.compare_digest(got, t) for t in accepted]
+    if any(results):
         return None
     _record_fail(ip)
     log.warning("鉴权失败：%s %s（来自 %s）", request.method, request.url.path, ip)

@@ -148,3 +148,83 @@ def test_conv_key_uses_first_five_user_messages_verbatim():
                {"role": "user", "content": "第二条" * 300}]
     assert M.conv_key(base) != M.conv_key(changed)
     assert M.legacy_conv_id(base) == M.legacy_conv_id(changed)
+
+
+def _reload_with(**server) -> list[str]:
+    """用一份临时配置跑一遍 config.reload，返回它发出的告警。"""
+    path = pathlib.Path(_TMP) / "cfg_warn.yaml"
+    path.write_text(yaml.safe_dump({
+        "providers": [{"name": "p", "base_url": "http://127.0.0.1:1/v1", "api_key": "k"}],
+        "summary": {"base_url": "http://127.0.0.1:1/v1", "api_key": "k", "model": "m",
+                    "persist_db": ""},
+        "server": server,
+    }, allow_unicode=True), encoding="utf-8")
+    old, warns = config.CONFIG_PATH, []
+    config.CONFIG_PATH = str(path)
+    try:
+        config.reload(lambda f, *a: warns.append(f % a if a else f))
+    finally:
+        config.CONFIG_PATH = old
+    return warns
+
+
+def test_empty_auth_token_warns_loudly():
+    """仓库里的 config.yaml 默认留空（不提交真实密钥），那就必须在启动时喊一声。"""
+    assert any("auth_token" in w and "不鉴权" in w for w in _reload_with()), _reload_with()
+    assert not any("auth_token" in w for w in _reload_with(auth_token="sk-proxy-x"))
+
+
+def test_admin_token_isolation_rules():
+    from cproxy.app import _accepted_tokens
+    _reload_with(auth_token="sk-chat", ui_token="uiTOKEN0123456789")
+    assert _accepted_tokens(admin=False) == ["sk-chat"]
+    assert _accepted_tokens(admin=True) == ["uiTOKEN0123456789"], "配了 ui_token 就别再认 auth_token"
+
+    _reload_with(auth_token="sk-chat")
+    assert _accepted_tokens(admin=False) == ["sk-chat"]
+    assert _accepted_tokens(admin=True) == ["sk-chat"], "没配 ui_token 时得留给 ctl.sh 用"
+
+    _reload_with()
+    assert _accepted_tokens(admin=False) == [] and _accepted_tokens(admin=True) == []
+
+
+def test_fallback_endpoint_has_max_attempts():
+    """漏了这个字段，切备用摘要模型时会 KeyError 而不是重试。"""
+    path = pathlib.Path(_TMP) / "cfg_fb.yaml"
+    path.write_text(yaml.safe_dump({
+        "providers": [{"name": "p", "base_url": "http://127.0.0.1:1/v1", "api_key": "k"}],
+        "summary": {"base_url": "http://127.0.0.1:1/v1", "api_key": "k", "model": "m",
+                    "persist_db": "", "main_max_attempts": 2,
+                    "extra_body": {"temperature": 0.5},
+                    "fallback": {"enabled": True, "base_url": "http://127.0.0.1:1/v1",
+                                 "api_key": "k2", "model": "m2"}},
+    }, allow_unicode=True), encoding="utf-8")
+    old = config.CONFIG_PATH
+    config.CONFIG_PATH = str(path)
+    try:
+        config.reload()
+        eps = config.summary_endpoints()
+    finally:
+        config.CONFIG_PATH = old
+        config.reload()
+    assert [e["tag"] for e in eps] == ["primary", "fallback"]
+    assert eps[0]["max_attempts"] == 2
+    assert eps[1]["max_attempts"] == 3, "fallback.max_attempts 没写时默认 3"
+    assert eps[1]["extra_body"] == {"temperature": 0.5}, "备用没写 extra_body 时沿用主模型的"
+
+
+def test_timeline_respects_retain_from_zero():
+    """窗口回退到 0（还没压过，或为了保住近期原文下限退到头）时，一轮都不该标成"已折叠"。"""
+    from cproxy import compress
+    body = [{"role": "user", "content": "问"}, {"role": "assistant", "content": "答"}] * 3
+    infos = M.analyze(body)
+    rounds = M.split_rounds(body)
+    # compressed_upto 还留着历史值，但这次实际从 0 开始逐字发——用 or 会把 0 当缺失
+    tl = compress.build_timeline(body, infos, rounds,
+                                 {"retain_from": 0, "compressed_upto": 4}, "p")
+    assert tl["retain_from"] == 0
+    assert all(r["c"] == 0 for r in tl["rounds"]), tl["rounds"]
+
+    tl2 = compress.build_timeline(body, infos, rounds,
+                                  {"retain_from": 4, "compressed_upto": 4}, "p")
+    assert [r["c"] for r in tl2["rounds"]] == [1, 1, 0]

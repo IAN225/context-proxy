@@ -71,7 +71,8 @@ CREATE INDEX IF NOT EXISTS idx_fp_conv ON fp_index(conv_id);
 CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 
 -- 每个会话只留**最新一份**请求快照（覆盖写），供页面画时间轴。
--- 只存结构与预览，不存原文；默认不开，见 observability.capture_timeline。
+-- 只存结构 + 每轮开头 preview_chars 字的预览（未脱敏），不存完整原文；
+-- 默认不开，见 observability.capture_timeline。
 CREATE TABLE IF NOT EXISTS timelines (
     conv_id    TEXT PRIMARY KEY,
     payload    TEXT NOT NULL,

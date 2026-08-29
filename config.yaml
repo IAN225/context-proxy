@@ -164,8 +164,9 @@ summary:
 # ===== 可观测（给 /ui 的时间轴用）=====
 observability:
   capture_timeline: false                      # 每次请求存一份「结构快照」，供页面画时间轴、
-                                               # 对比进来的和发出去的 payload。**只存结构与预览，
-                                               # 不存原文**。实测 4000 条的会话每请求约 +18ms
+                                               # 对比进来的和发出去的 payload。**只存结构，
+                                               # 加每轮开头 preview_chars 字的原文预览（未脱敏），
+                                               # 不存完整原文**。实测 4000 条的会话每请求约 +18ms
                                                # （构建 13ms + 落盘 5ms），快照约 460KB，
                                                # 每个会话只留最新一份（覆盖写）。默认关闭。
   preview_chars: 60                            # 时间轴里每轮显示多少字预览
@@ -186,12 +187,16 @@ tokenizer:
 server:
   host: "0.0.0.0"
   port: 8787
-  auth_token: "sk-proxy-forTarlinChat"         # 代理自身鉴权 token（环境变量 PROXY_AUTH_TOKEN 优先，留空则不鉴权）
-                                               # 这个要填进 chatbox，会跟着每个对话请求走
+  auth_token: ""                               # 代理自身鉴权 token（环境变量 PROXY_AUTH_TOKEN 优先，留空则不鉴权）
+                                               # 这个要填进 chatbox，会跟着每个对话请求走。
+                                               # ⚠️ 别把真实密钥提交进版本库，建议留空改用环境变量：
+                                               #    export PROXY_AUTH_TOKEN="sk-proxy-xxxx"
   ui_token: ""                                 # 可视化页面 http://<IP>:<port>/ui 的登录密钥，建议 16 位
                                                # 【留空 = 不启用页面】，环境变量 PROXY_UI_TOKEN 优先
-                                               # 用 ./ctl.sh ui-token 生成一个；它只能访问 /admin/*，
-                                               # 不能用来调 /chat/completions，和 auth_token 互不通用
+                                               # 用 ./ctl.sh ui-token 生成一个。两个 token 互不通用：
+                                               # ui_token 不能调 /chat/completions；而**一旦配了 ui_token，
+                                               # /admin/* 就只认 ui_token**，auth_token 不再有后台权限
+                                               # （没配 ui_token 时才退回 auth_token，供 ./ctl.sh 使用）
 
 # ===== 日志 =====
 logging:
