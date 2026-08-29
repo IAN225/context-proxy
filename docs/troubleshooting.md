@@ -95,6 +95,28 @@ URL 里的 `<name>` 和 `config.yaml` 的 `providers[].name` 对不上。Base UR
 - 能打开但提示密钥无效 → 填成了 `auth_token`。两者不通用，页面只认 `ui_token`。
 - 提示"密钥错误次数过多" → 连续错 10 次触发限流，等 5 分钟或重启服务清计数。
 - 页面正常但列表为空 → 还没有会话触发过压缩，属正常。
+- `./ctl.sh sessions` 突然返回 `unauthorized` → 刚给 `server.ui_token` 填了值。
+  设了 `ui_token` 之后 `/admin/*` 就**只认 `ui_token`**，`auth_token` 不再有后台权限。
+  `ctl.sh` 会自己从 config.yaml 读 `ui_token`；如果你的密钥是走环境变量的，
+  那就 `export PROXY_UI_TOKEN=...` 而不是 `PROXY_AUTH_TOKEN`。
+
+### 上游报 400 / 参数没生效
+
+先分清是哪一种：
+
+```bash
+python3 tools/probe_body.py <provider> --model <模型名>
+```
+
+它一个字段发一次最小请求，最后给出「可用 / 被拒」清单，
+并且**先用一个瞎编的字段做对照**，告诉你这家网关到底会不会校验未知字段：
+
+- 报错的字段直接从 `extra_body` 里删掉；
+- 如果对照组也返回 200，说明这家什么都收，那 `200` 不等于生效——
+  看报告里"真的产生了思考内容的组合"，思考类字段只有那几行是真开了。
+
+加 `--via-proxy` 就是走本地代理再打上去，可以顺带确认 `extra_body` 和白名单请求头
+确实被转发了出去。
 
 ### 想看这次请求到底发了什么 / 哪些轮被压掉了
 

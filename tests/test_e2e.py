@@ -105,12 +105,26 @@ def servers():
 _counter = {"n": 0}
 
 
+_ADMIN_H = dict(HEADERS)
+
+
+def admin_h() -> dict:
+    """/admin/* 该用的密钥：配了 ui_token 就只能用 ui_token，没配才是 auth_token。"""
+    return dict(_ADMIN_H)
+
+
+def _set_admin_token(ui_token: str) -> None:
+    _ADMIN_H.clear()
+    _ADMIN_H["Authorization"] = f"Bearer {ui_token or TOKEN}"
+
+
 def fresh(ui_token: str = "", **summary_overrides) -> None:
     """给每个用例一个干净的 DB 和配置。"""
     _counter["n"] += 1
     from cproxy import app as _a
     _a._FAIL.clear()                      # 清掉上个用例攒下的鉴权失败计数
     write_config(f"db/t{_counter['n']}.db", ui_token=ui_token, **summary_overrides)
+    _set_admin_token(ui_token)
     app_module.do_reload()
     httpx.post(f"{MOCK}/__reset", timeout=5)
 
@@ -145,11 +159,11 @@ def chat_calls():
 
 
 def sessions():
-    return httpx.get(f"{PROXY}/admin/sessions", headers=HEADERS, timeout=10).json()["sessions"]
+    return httpx.get(f"{PROXY}/admin/sessions", headers=admin_h(), timeout=10).json()["sessions"]
 
 
 def session_detail(conv_id: str):
-    return httpx.get(f"{PROXY}/admin/session/{conv_id}", headers=HEADERS, timeout=10).json()
+    return httpx.get(f"{PROXY}/admin/session/{conv_id}", headers=admin_h(), timeout=10).json()
 
 
 def ctl(**kw):
@@ -549,6 +563,61 @@ def test_rate_limit_is_retried():
     assert len(summary_calls()) >= 3
 
 
+FALLBACK = {"enabled": True, "base_url": f"{MOCK}/v1", "api_key": "sk-backup",
+            "model": "mock-summary-backup", "max_attempts": 3}
+
+
+def test_falls_back_to_backup_summary_model():
+    """主模型打光重试次数后必须真的切到备用模型，而不是在端点字典上炸掉。"""
+    fresh(main_max_attempts=1, fallback=FALLBACK)
+    ctl(fail_next=99, fail_status=500, fail_body={"error": {"message": "boom"}})
+    r = post("mm", convo(30))
+    assert r.status_code == 200, r.text
+
+    used = [c["model"] for c in summary_calls()]
+    backup = used.count("mock-summary-backup")
+    assert backup >= 1, f"没切到备用模型: {used}"
+    # 每一批都是"主试 1 次失败 → 备用兜住"，所以两边次数相等
+    assert used.count("mock-summary") == backup, used
+    # 压缩确实完成了：上游收到的条数远少于发进来的
+    assert chat_calls()[-1]["n_messages"] < len(convo(30))
+
+
+def test_backup_summary_model_retries_its_own_max_attempts():
+    """备用模型也会失败：max_attempts 必须被读到（漏传会 KeyError 而不是重试）。"""
+    fresh(main_max_attempts=1,
+          fallback={**FALLBACK, "model": "mock-summary", "max_attempts": 3})
+    ctl(fail_next=99, fail_status=500, fail_body={"error": {"message": "boom"}})
+    r = post("mm", convo(40))
+    assert r.status_code == 503, r.text
+    # 主 1 次 + 备 3 次 = 4；漏传 max_attempts 的话这里会是 500 KeyError
+    assert len(summary_calls()) == 4, [c["model"] for c in summary_calls()]
+    assert "KeyError" not in r.text
+
+
+def test_fallback_endpoint_carries_all_required_fields():
+    """端点字典的字段清单：调用链用到哪个就必须有哪个，缺一个就是运行时 KeyError。"""
+    fresh(fallback=FALLBACK)
+    from cproxy import config as _c
+    eps = _c.summary_endpoints()
+    assert [e["tag"] for e in eps] == ["primary", "fallback"]
+    for ep in eps:
+        assert set(ep) >= {"tag", "base_url", "api_key", "model", "max_attempts", "extra_body"}, ep
+        assert isinstance(ep["max_attempts"], int) and ep["max_attempts"] >= 1
+    assert eps[1]["max_attempts"] == 3
+
+
+def test_fallback_inherits_primary_extra_body():
+    fresh(main_max_attempts=1, extra_body={"temperature": 0.5, "enable_thinking": False},
+          fallback=FALLBACK)
+    ctl(fail_next=99, fail_status=500, fail_body={"error": {"message": "boom"}})
+    assert post("mm", convo(30)).status_code == 200
+    backup = [c for c in summary_calls() if c["model"] == "mock-summary-backup"]
+    assert backup, [c["model"] for c in summary_calls()]
+    assert backup[0]["extra"]["temperature"] == 0.5
+    assert backup[0]["extra"]["enable_thinking"] is False
+
+
 def test_short_output_counts_as_failure():
     fresh(main_max_attempts=2)
     ctl(short_next=1)
@@ -792,7 +861,7 @@ def test_stuck_window_recovers_without_edit_and_survives_editing_last_message():
 # ---- 手工查看 / 修改摘要 ----
 
 def _summary_api(conv_id, **kw):
-    return httpx.get(f"{PROXY}/admin/session/{conv_id}/summary", headers=HEADERS,
+    return httpx.get(f"{PROXY}/admin/session/{conv_id}/summary", headers=admin_h(),
                      params=kw, timeout=10)
 
 
@@ -800,7 +869,7 @@ def _put_summary(conv_id, text, base_seq=None):
     body = {"summary": text}
     if base_seq is not None:
         body["base_seq"] = base_seq
-    return httpx.put(f"{PROXY}/admin/session/{conv_id}/summary", headers=HEADERS,
+    return httpx.put(f"{PROXY}/admin/session/{conv_id}/summary", headers=admin_h(),
                      json=body, timeout=10)
 
 
@@ -901,6 +970,20 @@ def test_ctl_sh_edit_round_trip():
     assert "由 ctl.sh 写入" in _summary_api(cid).json()["summary"]
 
 
+def test_ctl_sh_prefers_ui_token_over_auth_token():
+    """配了 ui_token 后服务端不再认 auth_token，ctl.sh 必须自己切过去。"""
+    import subprocess
+    fresh(ui_token=UI_TOKEN)
+    base = {**os.environ, "PROXY_PORT": str(PROXY_PORT), "PROXY_AUTH_TOKEN": TOKEN}
+    only_auth = subprocess.run(["bash", str(ROOT / "ctl.sh"), "sessions"],
+                               capture_output=True, text=True, env=base, cwd=ROOT)
+    assert "unauthorized" in only_auth.stdout, only_auth.stdout
+
+    with_ui = subprocess.run(["bash", str(ROOT / "ctl.sh"), "sessions"], capture_output=True,
+                             text=True, env={**base, "PROXY_UI_TOKEN": UI_TOKEN}, cwd=ROOT)
+    assert with_ui.returncode == 0 and '"sessions"' in with_ui.stdout, with_ui.stdout
+
+
 # ---- 可视化页面与鉴权 ----
 
 def test_ui_disabled_without_token():
@@ -924,7 +1007,8 @@ def test_ui_page_served_when_token_set():
     assert UI_TOKEN not in body
 
 
-def test_ui_token_reaches_admin_but_not_chat():
+def test_two_tokens_are_fully_isolated():
+    """配了 ui_token 之后：ui_token 只能进后台，auth_token 只能走对话，互不越界。"""
     fresh(ui_token=UI_TOKEN)
     ui_h = {"Authorization": f"Bearer {UI_TOKEN}"}
     assert httpx.get(f"{PROXY}/admin/sessions", headers=ui_h, timeout=5).status_code == 200
@@ -932,9 +1016,19 @@ def test_ui_token_reaches_admin_but_not_chat():
     r = httpx.post(f"{PROXY}/mm/v1/chat/completions", headers=ui_h,
                    json={"model": "mock-chat", "messages": convo(2)}, timeout=10)
     assert r.status_code == 401
-    # auth_token 仍然两边都能用，ctl.sh 不受影响
-    assert httpx.get(f"{PROXY}/admin/sessions", headers=HEADERS, timeout=5).status_code == 200
+    # 反向也要挡住：auth_token 要填进 chatbox、跟着每个请求走，不能顺带是后台密码
+    from cproxy import app as _a
+    _a._FAIL.clear()
+    assert httpx.get(f"{PROXY}/admin/sessions", headers=HEADERS, timeout=5).status_code == 401
+    _a._FAIL.clear()
     assert post("mm", convo(2)).status_code == 200
+
+
+def test_auth_token_still_opens_admin_when_no_ui_token():
+    """没配 ui_token 时页面本来就是关的，此时 auth_token 得能进后台，否则 ctl.sh 全废。"""
+    fresh()
+    assert httpx.get(f"{PROXY}/admin/sessions", headers=HEADERS, timeout=5).status_code == 200
+    assert httpx.post(f"{PROXY}/admin/reload", headers=HEADERS, timeout=10).status_code == 200
 
 
 def test_wrong_key_is_rejected_then_throttled():
@@ -947,7 +1041,7 @@ def test_wrong_key_is_rejected_then_throttled():
     # 限流是按来源计的，正确密钥此时也会被挡（同一来源），清掉计数后恢复
     from cproxy import app as _a
     _a._FAIL.clear()
-    assert httpx.get(f"{PROXY}/admin/sessions", headers=HEADERS, timeout=5).status_code == 200
+    assert httpx.get(f"{PROXY}/admin/sessions", headers=admin_h(), timeout=5).status_code == 200
 
 
 def test_ui_summary_edit_flow_through_admin_api():
@@ -966,13 +1060,13 @@ def test_ui_summary_edit_flow_through_admin_api():
 
 def test_prompt_edit_takes_effect_and_can_be_reset():
     fresh(ui_token=UI_TOKEN)
-    got = httpx.get(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5).json()["prompts"]
+    got = httpx.get(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5).json()["prompts"]
     names = {p["name"] for p in got}
     assert names == {"batch_system", "recompress", "injection", "fallback_notice"}
     assert all(p["overridden"] is False for p in got)
 
     mark = "【这是页面上改的批次摘要提示词】"
-    r = httpx.put(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5,
+    r = httpx.put(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5,
                   json={"prompts": {"batch_system": mark + "请压缩下面的对话。"}})
     assert r.status_code == 200 and r.json()["overridden"] == ["batch_system"]
 
@@ -984,25 +1078,25 @@ def test_prompt_edit_takes_effect_and_can_be_reset():
     # 覆盖项跨热重载存活（存在 DB 里，不回写 config.yaml）
     app_module.do_reload()
     after = {p["name"]: p for p in
-             httpx.get(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5).json()["prompts"]}
+             httpx.get(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5).json()["prompts"]}
     assert after["batch_system"]["overridden"] is True
     assert mark in after["batch_system"]["effective"]
     assert mark not in after["batch_system"]["from_file"], "config.yaml 不该被回写"
 
     # 提交空字符串 = 恢复文件里的值
-    httpx.put(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5,
+    httpx.put(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5,
               json={"prompts": {"batch_system": ""}})
     back = {p["name"]: p for p in
-            httpx.get(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5).json()["prompts"]}
+            httpx.get(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5).json()["prompts"]}
     assert back["batch_system"]["overridden"] is False
 
 
 def test_injection_prompt_must_keep_placeholder():
     fresh(ui_token=UI_TOKEN)
-    r = httpx.put(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5,
+    r = httpx.put(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5,
                   json={"prompts": {"injection": "忘了写占位符"}})
     assert r.status_code == 400 and "{summary}" in r.json()["error"]["message"]
-    r = httpx.put(f"{PROXY}/admin/prompts", headers=HEADERS, timeout=5,
+    r = httpx.put(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5,
                   json={"prompts": {"不存在的提示词": "x"}})
     assert r.status_code == 400
 
@@ -1020,6 +1114,7 @@ def test_timeline_disabled_by_default():
 def test_timeline_marks_folded_rounds():
     _counter["n"] += 1
     write_config(f"db/tl{_counter['n']}.db", ui_token=UI_TOKEN)
+    _set_admin_token(UI_TOKEN)
     cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
     cfg["observability"] = {"capture_timeline": True, "preview_chars": 40}
     CFG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
@@ -1028,7 +1123,7 @@ def test_timeline_marks_folded_rounds():
 
     assert post("mm", convo(30)).status_code == 200
     cid = sessions()[0]["conv_id"]
-    tl = httpx.get(f"{PROXY}/admin/session/{cid}/timeline", headers=HEADERS, timeout=5).json()
+    tl = httpx.get(f"{PROXY}/admin/session/{cid}/timeline", headers=admin_h(), timeout=5).json()
 
     assert tl["total_rounds"] == 30 and len(tl["rounds"]) == 30
     assert tl["in"]["messages"] == 60 and tl["out"]["messages"] < 60
@@ -1044,7 +1139,7 @@ def test_timeline_marks_folded_rounds():
     # 只留最新一份：再发一次请求会覆盖，不会越堆越多
     before = tl["at"]
     assert post("mm", convo(30) + convo(1, start=99, head=False)).status_code == 200
-    tl2 = httpx.get(f"{PROXY}/admin/session/{cid}/timeline", headers=HEADERS, timeout=5).json()
+    tl2 = httpx.get(f"{PROXY}/admin/session/{cid}/timeline", headers=admin_h(), timeout=5).json()
     assert tl2["at"] > before and tl2["total_rounds"] == 31
 
 
@@ -1135,3 +1230,61 @@ def test_query_string_forwarding_is_opt_in():
     httpx.post(f"{PROXY}/mm/v1/chat/completions?api-version=2024-08-01", headers=HEADERS,
                timeout=30, json={"model": "mock-chat", "messages": convo(2)})
     assert chat_calls()[-1]["query"] == "api-version=2024-08-01"
+
+
+# ---- body 字段探测工具 ----
+
+def _run_probe(*args, env_extra=None):
+    import subprocess
+    # 显式钉住 PROXY_CONFIG：同一次 pytest 里别的测试模块也会改这个环境变量
+    return subprocess.run([sys.executable, str(ROOT / "tools" / "probe_body.py"), *args],
+                          capture_output=True, text=True, cwd=ROOT,
+                          env={**os.environ, "PROXY_CONFIG": str(CFG_PATH),
+                               **(env_extra or {})})
+
+
+def _probe_line(txt: str, prefix: str) -> str:
+    """取报告结尾那两行汇总（"可用 (n)：..." / "被拒 (n)：..."）。"""
+    return next(l for l in txt.splitlines() if l.startswith(prefix))
+
+
+def test_probe_reports_rejected_fields_on_a_strict_upstream():
+    """严格网关：对照组被拒 → 报告能断言"OK 的就是真认识的"。"""
+    fresh()
+    ctl(strict_body=True, reasoning_for=[])
+    out = _run_probe("mm", "--model", "mock-chat",
+                     "--only", "temperature,top_p,reasoning_effort,enable_thinking")
+    assert out.returncode == 0, out.stderr
+    txt = out.stdout
+    assert "会校验未知字段" in txt, txt
+    assert "temperature" in _probe_line(txt, "可用")
+    rejected = _probe_line(txt, "被拒")
+    assert "reasoning_effort=minimal" in rejected and "enable_thinking=true" in rejected
+    # 每个探针都真发了一次请求，且都是最小请求（不会顺手把账单打爆）
+    probes = [c for c in chat_calls() if c["n_messages"] == 1]
+    assert len(probes) >= 5 and all(c["chars"] < 200 for c in probes)
+
+
+def test_probe_flags_a_lenient_upstream_as_inconclusive():
+    """宽松网关：什么都收 200，报告必须说清楚"不代表生效"，并给出思考侧信号。"""
+    fresh()
+    ctl(strict_body=False, reasoning_for=["reasoning_effort", "thinking"])
+    out = _run_probe("mm", "--model", "mock-chat", "--only", "reasoning_effort,temperature")
+    assert out.returncode == 0, out.stderr
+    txt = out.stdout
+    assert "不校验未知字段" in txt and "不说明生效" in txt, txt
+    assert "真的产生了思考内容的组合" in txt
+    assert "reasoning_effort=high" in txt.split("真的产生了思考内容的组合")[1]
+    # temperature 没被列进 reasoning_for，不该被误报成"开了思考"
+    assert "temperature" not in txt.split("真的产生了思考内容的组合")[1]
+
+
+def test_probe_accepts_custom_fields_and_reports_upstream_error_text():
+    fresh()
+    ctl(strict_body=True)
+    out = _run_probe("mm", "--model", "mock-chat", "--only", "temperature",
+                     "--extra", '{"厂商私有字段": 1}')
+    assert out.returncode == 0, out.stderr
+    assert "厂商私有字段(自定义)" in out.stdout
+    # 上游的原始报错要照抄出来，不然用户不知道为什么被拒
+    assert "Unrecognized request argument" in out.stdout
