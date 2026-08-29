@@ -8,9 +8,17 @@ STDERR_LOG="logs/stderr.log"      # 只兜住进程级崩溃输出；正常日�
 LOG="logs/proxy.log"
 PORT="${PROXY_PORT:-8787}"
 
-TOKEN="${PROXY_AUTH_TOKEN:-}"
-if [ -z "$TOKEN" ] && [ -f config.yaml ]; then
-  TOKEN=$(grep -E '^\s*auth_token:' config.yaml | head -1 | sed -E 's/.*auth_token:\s*"?([^"#]*)"?.*/\1/' | xargs || true)
+# 本脚本只调 /admin/*：配了 ui_token 就必须用 ui_token（服务端此时不再认 auth_token），
+# 没配才退回 auth_token。环境变量优先于 config.yaml。
+_cfg_val() { # _cfg_val KEY
+  [ -f config.yaml ] || return 0
+  grep -E "^\s*$1:" config.yaml | head -1 | sed -E "s/.*$1:\s*\"?([^\"#]*)\"?.*/\1/" | xargs || true
+}
+TOKEN="${PROXY_UI_TOKEN:-}"
+[ -n "$TOKEN" ] || TOKEN=$(_cfg_val ui_token)
+if [ -z "$TOKEN" ]; then
+  TOKEN="${PROXY_AUTH_TOKEN:-}"
+  [ -n "$TOKEN" ] || TOKEN=$(_cfg_val auth_token)
 fi
 
 if [ -x "venv/bin/python" ] && venv/bin/python -c "import httpx" 2>/dev/null; then

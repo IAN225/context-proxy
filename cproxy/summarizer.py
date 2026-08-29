@@ -156,7 +156,9 @@ async def call_chain(system_prompt: str, user_prompt: str, max_tokens: int,
 
     for ep in endpoints:
         who = f"{ep['tag']}:{ep['model']}"
-        for attempt in range(1, ep["max_attempts"] + 1):
+        # 用 get 而不是下标：端点字典少一个字段也只该退化成"不重试"，不该炸在这里
+        max_attempts = max(1, int(ep.get("max_attempts", 1)))
+        for attempt in range(1, max_attempts + 1):
             try:
                 text = await _one_call(ep, system_prompt, user_prompt, max_tokens, timeout_s)
                 if attempts_log:
@@ -170,7 +172,7 @@ async def call_chain(system_prompt: str, user_prompt: str, max_tokens: int,
                 if e.kind == "auth":
                     log.error("%s：%s 鉴权/余额错误，不重试该端点：%s", label, who, e.message[:300])
                     break
-                if not e.retryable or attempt >= ep["max_attempts"]:
+                if not e.retryable or attempt >= max_attempts:
                     log.warning("%s：%s 第 %d 次失败（%s），%s", label, who, attempt, e.kind,
                                 "切换备用模型" if ep is not endpoints[-1] else "无可用备用模型")
                     break

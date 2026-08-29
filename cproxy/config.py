@@ -196,6 +196,10 @@ def reload(warn=lambda *a, **k: None) -> dict[str, Any]:
         "auth": _resolve_secret("PROXY_AUTH_TOKEN", cfg["server"].get("auth_token")),
         "ui": _resolve_secret("PROXY_UI_TOKEN", cfg["server"].get("ui_token")),
     }
+    if not secrets["auth"]:
+        warn("server.auth_token 为空 = 不鉴权：任何人碰得到这个端口就能用你的上游额度。"
+             "仓库里的 config.yaml 默认留空是为了不提交真实密钥，自己填一个，"
+             "或用环境变量 PROXY_AUTH_TOKEN")
     if secrets["ui"] and len(secrets["ui"]) < UI_TOKEN_MIN_LEN:
         warn("server.ui_token 只有 %d 位，建议至少 %d 位——这个页面能看到全部对话摘要，"
              "而且往往开在公网端口上（用 ./ctl.sh ui-token 生成一个）",
@@ -316,6 +320,7 @@ def summary_endpoints() -> list[dict[str, Any]]:
             "base_url": str(fb["base_url"]).rstrip("/"),
             "api_key": _SECRETS["summary_fallback"],
             "model": fb["model"],
+            "max_attempts": max(1, int(fb.get("max_attempts", 3))),
             # 备用模型没写 extra_body 就沿用主模型的（通常两边想关的思考是同一套）
             "extra_body": _clean_extra_body(fb.get("extra_body", s.get("extra_body")),
                                             "summary.fallback", lambda *a: None),
