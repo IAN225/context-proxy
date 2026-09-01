@@ -13,7 +13,7 @@ import time
 
 import uvicorn
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 STATE = {
     "fail_next": 0,          # 接下来 N 次摘要请求返回 status
@@ -28,14 +28,19 @@ STATE = {
     "strict_message": "Unrecognized request argument supplied: {fields}",
     "reasoning_for": [],     # 命中这些 body 字段时在响应里带上思考内容
     "chat_status": 0,        # 非 0 = 对话请求返回这个状态（模拟 key 错、端点挂了）
+    "fake_success": "",      # 非空 = HTTP 200 但正文是这段（模拟中转站把报错当模型输出发回来）
+    "html_success": False,   # true = HTTP 200 但返回 HTML（模拟 Cloudflare 错误页）
+    "reject_unknown_max_tokens": False,   # true = 只认 max_completion_tokens（模拟 OpenAI 新模型）
+    "delay_seconds": 0.0,    # 每次摘要调用故意慢一点，好在批与批之间插进去中止
     "chat_status_after": 0,  # chat_status 从第几次对话请求开始生效（0 = 从第一次就生效）
     "field_status": {},      # {body 字段名: 状态码}，命中就返回该状态（模拟限流打在某个探针上）
     "field_status_once": False,   # true = field_status 只生效一次（用来验证重试）
 }
 
 # 严格模式下允许出现的 body 字段
-KNOWN_BODY_KEYS = {"model", "messages", "stream", "max_tokens", "temperature", "top_p",
-                   "seed", "presence_penalty", "frequency_penalty", "stop", "user"}
+KNOWN_BODY_KEYS = {"model", "messages", "stream", "max_tokens", "max_completion_tokens",
+                   "temperature", "top_p", "seed", "presence_penalty", "frequency_penalty",
+                   "stop", "user"}
 
 app = FastAPI()
 
@@ -56,7 +61,8 @@ async def reset():
     STATE.update({"fail_next": 0, "fail_after": -1, "fail_status": 500, "short_next": 0,
                   "calls": [], "summary_calls": 0, "summary_text": None,
                   "strict_body": False, "reasoning_for": [], "chat_status": 0,
-                  "chat_status_after": 0,
+                  "chat_status_after": 0, "fake_success": "", "html_success": False,
+                  "reject_unknown_max_tokens": False, "delay_seconds": 0.0,
                   "field_status": {}, "field_status_once": False,
                   "strict_message": "Unrecognized request argument supplied: {fields}"})
     return {"ok": True}
@@ -95,8 +101,11 @@ async def chat(request: Request):
                              for p in m["content"]) for m in msgs),
         "system_preview": next((str(m.get("content"))[:120] for m in msgs
                                 if m.get("role") == "system"), None),
+        # 代理注入的那条摘要（带 [CONTEXT_SUMMARY] 前缀），用来验证发出去的到底是哪一版
+        "injected_summary": next((str(m.get("content"))[:2000] for m in msgs
+                                  if "[CONTEXT_SUMMARY]" in str(m.get("content", ""))), None),
         # 摘要请求的 user prompt（里面是被渲染成文本的那一批原文）
-        "prompt": str(msgs[-1].get("content", ""))[:4000] if msgs else "",
+        "prompt": str(msgs[-1].get("content", ""))[:8000] if msgs else "",
         "stream": bool(body.get("stream")),
         "extra": {k: v for k, v in body.items()
                   if k not in ("model", "messages", "stream", "max_tokens")},
@@ -119,6 +128,16 @@ async def chat(request: Request):
             return JSONResponse(status_code=int(status),
                                 content={"error": {"message": f"transient on {field}"}})
 
+    if STATE["html_success"]:
+        return Response(status_code=200, media_type="text/html",
+                        content="<!DOCTYPE html><html><body>Cloudflare: Bad gateway</body></html>")
+    if STATE["fake_success"]:
+        return _completion(STATE["fake_success"])
+    if STATE["reject_unknown_max_tokens"] and "max_tokens" in body:
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "Unsupported parameter: 'max_tokens' is not supported with this model. "
+                       "Use 'max_completion_tokens' instead.", "type": "invalid_request_error"}})
+
     if STATE["strict_body"]:
         unknown = [k for k in body if k not in KNOWN_BODY_KEYS]
         if unknown:
@@ -130,6 +149,8 @@ async def chat(request: Request):
 
     if _is_summary(body):
         STATE["summary_calls"] += 1
+        if STATE["delay_seconds"]:
+            await asyncio.sleep(float(STATE["delay_seconds"]))
         exhausted = 0 <= STATE["fail_after"] < STATE["summary_calls"]
         if _is_backup(body):
             return _completion(STATE["summary_text"] or _fake_summary(msgs))

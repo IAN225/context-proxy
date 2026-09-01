@@ -116,9 +116,12 @@ open(sys.argv[2], "w", encoding="utf-8").write(d["summary"])
 print("会话 {}｜base_seq={}｜{} tokens（上限 {}）｜已压到第 {}/{} 轮".format(
     d["conv_id"][:16], d["base_seq"], d["summary_tokens"], d["summary_cap_tokens"],
     d["round_upto"], d["total_rounds"]), file=sys.stderr)
-if not d.get("editable"):
-    print("⚠️  该会话正在压缩中（事件 seq={}），现在存回会被拒绝".format(
-        d.get("open_event_seq")), file=sys.stderr)
+if d.get("busy"):
+    print("⚠️  该会话此刻有请求在跑，现在存回可能被拒绝，等它结束再改", file=sys.stderr)
+elif d.get("unfinished_event_seq") is not None:
+    print("提示：上次压缩没压完（事件 seq={}），不影响编辑；"
+          "存回后那个半成品会作废，下次请求从你这条继续压".format(
+              d.get("unfinished_event_seq")), file=sys.stderr)
 PY
     cp "$tmp" "$tmp.orig"
     "${EDITOR:-vi}" "$tmp"
@@ -142,10 +145,16 @@ PY
     fi
     _api POST /admin/clean "{\"target\":\"$2\"}"
     ;;
+  tasks) _api GET /admin/tasks ;;
+  cancel)
+    [ -z "${2:-}" ] && { echo "用法: $0 cancel <conv_id 前几位>"; exit 1; }
+    _api POST "/admin/session/$2/cancel"
+    ;;
+  models) _api GET /admin/models ;;
   log) tail -f "$LOG" ;;
   errlog) tail -f "$STDERR_LOG" ;;
   *)
-    echo "用法: $0 {start|stop|restart|reload|status|log|errlog|sessions|session <id>|summary <id>|edit <id>|ui-token|clean all|clean <id>}"
+    echo "用法: $0 {start|stop|restart|reload|status|log|errlog|sessions|session <id>|summary <id>|edit <id>|tasks|cancel <id>|models|ui-token|clean all|clean <id>}"
     exit 1
     ;;
 esac

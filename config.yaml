@@ -46,7 +46,7 @@ summary:
                                                # 自动封顶：有效值不超过 trigger_tokens 的 50%。
                                                # 实际生效值见 /health 的 keep_recent_tokens_effective
   summary_total_cap_tokens: 12800              # 累积摘要超过此值触发二次重压
-  summary_max_tokens: 2400                     # 单次摘要调用的输出上限
+  summary_max_tokens: 2048                     # 单次摘要调用的输出上限
   summary_batch_tokens: 10000                  # 单批送入摘要模型的输入上限
   max_batches_per_request: 4                   # 单请求最多压几批，压不完带着已落盘进度返回
   exit_gate_ratio: 1.2                         # 出口闸门：转发前实测超过 trigger×此值直接拒绝
@@ -67,6 +67,9 @@ summary:
   timeout_seconds: 180                         # 单次摘要调用超时（秒）
   main_max_attempts: 2                         # 主模型重试次数（仅对超时/5xx/429 生效）
   min_output_tokens: 50                        # 输出（不含思考）低于此 token 数判定为失败
+  max_tokens_field: "max_tokens"                # 发 token 上限用哪个字段名。
+                                               # OpenAI 新模型只认 max_completion_tokens，别的只认 max_tokens。
+                                               # 【别按 URL 猜】：/ui 控制台点「检测传参方言」问一次上游
 
   # 摘要是照着原文复述要点，思考没什么用还慢又贵，温度低一点更稳——
   # 所以这里通常和主模型配得正好相反。同样先用 probe_body.py 确认字段名。
@@ -85,10 +88,12 @@ summary:
     max_attempts: 3                            # 仍失败则报错结束
     # extra_body:                              # 不写就沿用主摘要模型的
 
-  # --- 提示词（页面上也能改，见 /ui）---
+  # --- 提示词（页面上改完直接写回本文件，见 /ui）---
+  # 前两条是**整条 user 消息的模板**，原样发给摘要模型（不再拆 system + 系统包装语）。
+  # {{context}} 是必需占位符，待处理的正文插在那里；写在哪一行都行，前后随便加话。
   prompts:
     # 1) 增量批次摘要：把一段原文对话压成结构化要点
-    batch_system: |
+    batch: |
       你是一个对话历史压缩器。你接收到的是用户与模型对话中【较早的一段对话历史】，
       原文将被你的摘要【替换】后注入上下文（最近若干轮原文由系统滑动保留，不在你的处理范围内）。
       你的摘要是后续对话唯一能依赖的早期记忆，任何遗漏将永久丢失。
@@ -119,6 +124,9 @@ summary:
       ## 关键代码与数据
       原样保留后续仍需引用的代码片段、命令、数据结构、报错信息。
 
+      以下是待压片段
+      {{context}}
+
     # 2) 二次重压：累积摘要超过 cap 时逐片精简。和批次摘要同构——
     #    按 summary_batch_tokens 切片，每片调一次，系统用空行拼接，不再单独合并
     recompress: |
@@ -133,12 +141,15 @@ summary:
         也不要写"以下是精简后的摘要"之类的开场白。
       - 你可能只拿到全文的一个片段，不要为全文下结论，也不要试图补全缺失部分。
 
-    # 3) 注入给主模型的包装语（{summary} 会被替换成累积摘要全文）
+      以下是待精简的摘要
+      {{context}}
+
+    # 3) 注入给主模型的包装语（{{summary}} 会被替换成累积摘要全文；旧写法 {summary} 仍然认）
     injection: |
       以下是本次对话更早部分的摘要（原文已被折叠，不再发送）。请把它当作你自己的记忆，
       与后面的原文对话无缝衔接，不要向用户提及"摘要"或本段说明的存在。
 
-      {summary}
+      {{summary}}
 
     # 4) 定位兜底时追加的警告（拼在 injection 之后，并额外注入一条提示给主模型）
     fallback_notice: |
