@@ -41,7 +41,6 @@ import argparse
 import asyncio
 import json
 import os
-import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -49,13 +48,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import httpx  # noqa: E402
 
 from cproxy import config  # noqa: E402
+from cproxy import probe as P  # noqa: E402
 
-# 一次探测发的最小请求：要求模型只回一个字，省钱也省时间
-BASE_BODY: dict = {
-    "messages": [{"role": "user", "content": "回答一个字：好"}],
-    "max_tokens": 16,
-    "stream": False,
-}
+# 判定规则（未知字段措辞、瞬时错误状态码、三档分类）统一放在 cproxy/probe.py，
+# 控制台的保存校验用的是同一套，省得两边结论不一致
+UNKNOWN_FIELD_PAT = P.UNKNOWN_FIELD_PAT
+ACCEPT, REJECT, UNKNOWN = P.ACCEPT, P.REJECT, P.UNKNOWN
 
 BASELINE = "__baseline__"
 CONTROL = "__control_unknown_field__"
@@ -77,20 +75,6 @@ PROBES: list[tuple[str, dict]] = [
     ("seed", {"seed": 42}),
     ("presence_penalty", {"presence_penalty": 0.1}),
 ]
-
-# 报错文本长这样才算"这家在校验未知字段"。各家措辞不同，覆盖常见几种。
-UNKNOWN_FIELD_PAT = re.compile(
-    r"unknown|unrecogni[sz]ed|unexpected|unsupported|not\s+(?:a\s+)?(?:permitted|allowed|supported)"
-    r"|extra\s+(?:field|input|propert)|additional\s+propert|no\s+such\s+(?:field|parameter)"
-    r"|invalid[^.;]{0,24}(?:field|parameter|argument|propert|key)"
-    r"|未知|无法识别|不支持|不允许|非法参数|多余(?:的)?(?:字段|参数)",
-    re.I)
-
-# 这些结果是"这次没问上去"，不是"上游不认这个字段"
-TRANSIENT = {0, 408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
-
-ACCEPT, REJECT, UNKNOWN = "accept", "reject", "unknown"
-
 
 def _endpoint(target: str, via_proxy: bool) -> tuple[str, str, str]:
     """返回 (base_url, api_key, model)。"""
@@ -117,77 +101,13 @@ def _endpoint(target: str, via_proxy: bool) -> tuple[str, str, str]:
     return p["base_url"], p["api_key"], ""
 
 
-def _reasoning_of(data: dict) -> str:
-    """把各家的思考字段捞出来，用来判断"思考到底开没开"。"""
-    try:
-        msg = data["choices"][0].get("message") or {}
-    except (KeyError, IndexError, TypeError):
-        return ""
-    for k in ("reasoning_content", "reasoning", "thinking"):
-        v = msg.get(k)
-        if isinstance(v, str) and v.strip():
-            return v
-        if isinstance(v, list):                      # Anthropic 风格的 block 数组
-            return " ".join(str(b.get("thinking", "")) for b in v if isinstance(b, dict))
-    return ""
-
-
-def _classify(res: dict) -> str:
-    """一次请求的结果说明了什么。
-
-    只有 2xx 和 400/422 能说明"上游认不认这个字段"；
-    401/403/429/5xx/网络错误说明的是**这次没问上去**，必须区分对待，
-    否则一次限流就会让人把一个好字段从 extra_body 里删掉。
-    """
-    if res["ok"]:
-        return ACCEPT
-    if res["status"] in (400, 422):
-        return REJECT
-    return UNKNOWN
-
-
-async def _once(client: httpx.AsyncClient, url: str, headers: dict, model: str,
-                name: str, patch: dict) -> dict:
-    body = dict(BASE_BODY)
-    if model:
-        body["model"] = model
-    body.update(patch)
-    try:
-        r = await client.post(url, headers=headers, json=body)
-    except Exception as e:                            # noqa: BLE001 网络层错误也是结果
-        return {"name": name, "status": 0, "ok": False,
-                "note": f"请求失败: {type(e).__name__}: {e}"}
-
-    out: dict = {"name": name, "status": r.status_code, "ok": r.is_success}
-    if not r.is_success:
-        out["note"] = r.text.strip().replace("\n", " ")[:220]
-        return out
-    try:
-        data = r.json()
-    except ValueError:
-        out["ok"] = False
-        out["note"] = "2xx 但响应不是 JSON（多半是网关的错误页）：" + r.text[:160]
-        return out
-    usage = data.get("usage") or {}
-    reasoning = _reasoning_of(data)
-    out["reasoning_chars"] = len(reasoning)
-    out["completion_tokens"] = usage.get("completion_tokens")
-    out["reasoning_tokens"] = ((usage.get("completion_tokens_details") or {})
-                               .get("reasoning_tokens"))
-    return out
-
-
 async def _probe(client: httpx.AsyncClient, url: str, headers: dict, model: str,
                  name: str, patch: dict, *, retry_delay: float = 2.0) -> dict:
-    """发一次；碰上限流/5xx/网络错误就再试一次，别让一次抖动变成一条结论。"""
-    res = await _once(client, url, headers, model, name, patch)
-    if not res["ok"] and res["status"] in TRANSIENT:
-        await asyncio.sleep(retry_delay)
-        again = await _once(client, url, headers, model, name, patch)
-        again["retried"] = True
-        res = again
-    res["kind"] = _classify(res)
-    return res
+    body = P.build_body(model, patch, max_tokens=P.PROBE_MAX_TOKENS)
+    res = await P.probe(client, url, headers, body, name, retry_delay=retry_delay)
+    d = res.to_dict()
+    # 200 但不是 JSON / 没有 choices 这类，probe 已经判成不 ok 了，note 里有原因
+    return d
 
 
 async def main() -> int:

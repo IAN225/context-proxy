@@ -85,10 +85,15 @@ async def _one_call(ep: dict[str, Any], user_prompt: str,
     payload = {
         **(ep.get("extra_body") or {}),
         "model": ep["model"],
-        "max_tokens": max_tokens,
         "stream": False,
         "messages": [{"role": "user", "content": user_prompt}],
     }
+    # token 上限的字段名不是一家说了算：OpenAI 新模型只认 max_completion_tokens，
+    # 别的只认 max_tokens。填哪个由 summary.max_tokens_field 决定（控制台能探测出来），
+    # 并且把 extra_body 里可能写着的另一个名字清掉，免得两个一起发过去被判冲突。
+    for f in config.MAX_TOKENS_FIELDS:
+        payload.pop(f, None)
+    payload[config.max_tokens_field()] = max_tokens
     to = httpx.Timeout(connect=30.0, read=timeout_s, write=timeout_s, pool=timeout_s)
     try:
         async with httpx.AsyncClient(timeout=to) as client:
@@ -196,7 +201,7 @@ async def summarize_batch(batch: list[dict], depth: int = 0) -> tuple[str, str]:
     s = config.summary()
     user = config.render_prompt("batch", M.render_for_summary(batch))
     try:
-        return await call_chain(user, int(s.get("summary_max_tokens", 2400)),
+        return await call_chain(user, int(s.get("summary_max_tokens", 2048)),
                                 label=f"批次摘要({len(batch)} 条)")
     except _CallError as e:      # call_chain 只会把 context 类原样抛上来
         if e.kind != "context" or len(batch) < 2 or depth >= 3:
@@ -259,7 +264,7 @@ async def _condense(text: str, depth: int = 0) -> tuple[str, str]:
     s = config.summary()
     try:
         return await call_chain(config.render_prompt("recompress", text),
-                                int(s.get("summary_max_tokens", 2400)),
+                                int(s.get("summary_max_tokens", 2048)),
                                 label=f"二次重压({M.text_tokens(text)} tokens)")
     except _CallError as e:
         if e.kind != "context" or depth >= 3:

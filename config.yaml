@@ -46,7 +46,7 @@ summary:
                                                # 自动封顶：有效值不超过 trigger_tokens 的 50%。
                                                # 实际生效值见 /health 的 keep_recent_tokens_effective
   summary_total_cap_tokens: 12800              # 累积摘要超过此值触发二次重压
-  summary_max_tokens: 2400                     # 单次摘要调用的输出上限
+  summary_max_tokens: 2048                     # 单次摘要调用的输出上限
   summary_batch_tokens: 10000                  # 单批送入摘要模型的输入上限
   max_batches_per_request: 4                   # 单请求最多压几批，压不完带着已落盘进度返回
   exit_gate_ratio: 1.2                         # 出口闸门：转发前实测超过 trigger×此值直接拒绝
@@ -67,6 +67,9 @@ summary:
   timeout_seconds: 180                         # 单次摘要调用超时（秒）
   main_max_attempts: 2                         # 主模型重试次数（仅对超时/5xx/429 生效）
   min_output_tokens: 50                        # 输出（不含思考）低于此 token 数判定为失败
+  max_tokens_field: "max_tokens"                # 发 token 上限用哪个字段名。
+                                               # OpenAI 新模型只认 max_completion_tokens，别的只认 max_tokens。
+                                               # 【别按 URL 猜】：/ui 控制台点「检测传参方言」问一次上游
 
   # 摘要是照着原文复述要点，思考没什么用还慢又贵，温度低一点更稳——
   # 所以这里通常和主模型配得正好相反。同样先用 probe_body.py 确认字段名。
