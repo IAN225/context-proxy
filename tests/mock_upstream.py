@@ -27,6 +27,7 @@ STATE = {
     "strict_body": False,    # true = 遇到白名单外的 body 字段返回 400（模拟严格网关）
     "strict_message": "Unrecognized request argument supplied: {fields}",
     "reasoning_for": [],     # 命中这些 body 字段时在响应里带上思考内容
+    "reasoning_for_values": {},  # {字段: [取值]}，仅精确命中指定取值时带思考内容
     "chat_status": 0,        # 非 0 = 对话请求返回这个状态（模拟 key 错、端点挂了）
     "fake_success": "",      # 非空 = HTTP 200 但正文是这段（模拟中转站把报错当模型输出发回来）
     "html_success": False,   # true = HTTP 200 但返回 HTML（模拟 Cloudflare 错误页）
@@ -60,7 +61,8 @@ async def calls():
 async def reset():
     STATE.update({"fail_next": 0, "fail_after": -1, "fail_status": 500, "short_next": 0,
                   "calls": [], "summary_calls": 0, "summary_text": None,
-                  "strict_body": False, "reasoning_for": [], "chat_status": 0,
+                  "strict_body": False, "reasoning_for": [], "reasoning_for_values": {},
+                  "chat_status": 0,
                   "chat_status_after": 0, "fake_success": "", "html_success": False,
                   "reject_unknown_max_tokens": False, "delay_seconds": 0.0,
                   "field_status": {}, "field_status_once": False,
@@ -146,6 +148,10 @@ async def chat(request: Request):
                 "type": "invalid_request_error"}})
 
     hit = [k for k in STATE["reasoning_for"] if k in body]
+    for field, expected_values in STATE["reasoning_for_values"].items():
+        values = expected_values if isinstance(expected_values, list) else [expected_values]
+        if field in body and any(body[field] == expected for expected in values):
+            hit.append(field)
 
     if _is_summary(body):
         STATE["summary_calls"] += 1

@@ -65,7 +65,7 @@ summary:
   api_key: ""                                  # 环境变量 SUMMARY_API_KEY 优先
   model: "claude-opus-4-8"
   timeout_seconds: 180                         # 单次摘要调用超时（秒）
-  main_max_attempts: 2                         # 主模型重试次数（仅对超时/5xx/429 生效）
+  main_max_attempts: 2                         # 主模型最大尝试次数（含首次；超时/5xx/429 才重试）
   min_output_tokens: 50                        # 输出（不含思考）低于此 token 数判定为失败
   max_tokens_field: "max_tokens"                # 发 token 上限用哪个字段名。
                                                # OpenAI 新模型只认 max_completion_tokens，别的只认 max_tokens。
@@ -85,8 +85,12 @@ summary:
     base_url: ""
     api_key: ""                                # 环境变量 SUMMARY_FALLBACK_API_KEY 优先
     model: ""
-    max_attempts: 3                            # 仍失败则报错结束
-    # extra_body:                              # 不写就沿用主摘要模型的
+    summary_max_tokens: 2048                   # 单次输出上限，可与主摘要模型独立配置
+    max_tokens_field: "max_tokens"             # max_tokens / max_completion_tokens
+    timeout_seconds: 180
+    max_attempts: 3                            # 最大尝试次数（含首次调用）
+    min_output_tokens: 50
+    # extra_body:                              # 独立配置；控制台会按实际值写入
 
   # --- 提示词（页面上改完直接写回本文件，见 /ui）---
   # 前两条是**整条 user 消息的模板**，原样发给摘要模型（不再拆 system + 系统包装语）。

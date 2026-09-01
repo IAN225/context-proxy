@@ -605,9 +605,24 @@ def test_fallback_endpoint_carries_all_required_fields():
     eps = _c.summary_endpoints()
     assert [e["tag"] for e in eps] == ["primary", "fallback"]
     for ep in eps:
-        assert set(ep) >= {"tag", "base_url", "api_key", "model", "max_attempts", "extra_body"}, ep
+        assert set(ep) >= {"tag", "base_url", "api_key", "model", "summary_max_tokens",
+                           "max_tokens_field", "timeout_seconds", "max_attempts",
+                           "min_output_tokens", "extra_body"}, ep
         assert isinstance(ep["max_attempts"], int) and ep["max_attempts"] >= 1
     assert eps[1]["max_attempts"] == 3
+
+
+def test_fallback_uses_its_own_request_options():
+    fallback = {**FALLBACK, "summary_max_tokens": 321,
+                "max_tokens_field": "max_completion_tokens", "timeout_seconds": 12,
+                "min_output_tokens": 5, "extra_body": {"temperature": 0.2, "seed": 7}}
+    fresh(main_max_attempts=1, fallback=fallback)
+    ctl(fail_next=99, fail_status=500, fail_body={"error": {"message": "boom"}})
+    assert post("mm", convo(30)).status_code == 200
+    backup = next(c for c in summary_calls() if c["model"] == "mock-summary-backup")
+    assert backup["extra"]["max_completion_tokens"] == 321
+    assert backup["extra"]["temperature"] == 0.2
+    assert backup["extra"]["seed"] == 7
 
 
 def test_fallback_inherits_primary_extra_body():
@@ -1059,17 +1074,20 @@ def test_ctl_sh_edit_round_trip():
     cid = sessions()[0]["conv_id"]
 
     fake_editor = TMP / "fake_editor.sh"
-    fake_editor.write_text("#!/bin/sh\nprintf '%s' '## 关键事实与专有名词\\n- 由 ctl.sh 写入' > \"$1\"\n")
+    fake_editor.write_text(
+        "#!/bin/sh\nprintf '%s' '## 关键事实与专有名词\\n- 由 ctl.sh 写入' > \"$1\"\n",
+        encoding="utf-8",
+    )
     fake_editor.chmod(0o755)
     env = {**os.environ, "EDITOR": str(fake_editor), "PROXY_AUTH_TOKEN": TOKEN,
            "PROXY_PORT": str(PROXY_PORT)}
 
     out = subprocess.run(["bash", str(ROOT / "ctl.sh"), "summary", cid[:12]],
-                         capture_output=True, text=True, env=env, cwd=ROOT)
+                         capture_output=True, text=True, encoding="utf-8", env=env, cwd=ROOT)
     assert out.returncode == 0 and "##" in out.stdout, out
 
     out = subprocess.run(["bash", str(ROOT / "ctl.sh"), "edit", cid[:12]],
-                         capture_output=True, text=True, env=env, cwd=ROOT)
+                         capture_output=True, text=True, encoding="utf-8", env=env, cwd=ROOT)
     assert out.returncode == 0, out.stderr
     assert '"status": "updated"' in out.stdout, out.stdout
     assert "由 ctl.sh 写入" in _summary_api(cid).json()["summary"]
@@ -1081,11 +1099,12 @@ def test_ctl_sh_prefers_ui_token_over_auth_token():
     fresh(ui_token=UI_TOKEN)
     base = {**os.environ, "PROXY_PORT": str(PROXY_PORT), "PROXY_AUTH_TOKEN": TOKEN}
     only_auth = subprocess.run(["bash", str(ROOT / "ctl.sh"), "sessions"],
-                               capture_output=True, text=True, env=base, cwd=ROOT)
+                               capture_output=True, text=True, encoding="utf-8", env=base, cwd=ROOT)
     assert "unauthorized" in only_auth.stdout, only_auth.stdout
 
     with_ui = subprocess.run(["bash", str(ROOT / "ctl.sh"), "sessions"], capture_output=True,
-                             text=True, env={**base, "PROXY_UI_TOKEN": UI_TOKEN}, cwd=ROOT)
+                             text=True, encoding="utf-8",
+                             env={**base, "PROXY_UI_TOKEN": UI_TOKEN}, cwd=ROOT)
     assert with_ui.returncode == 0 and '"sessions"' in with_ui.stdout, with_ui.stdout
 
 
@@ -1640,7 +1659,7 @@ def test_overwrite_refuses_a_partial_slot():
     seq = _summary_api(cid).json()["base_seq"]
     r = httpx.put(f"{PROXY}/admin/session/{cid}/checkpoint/{seq}", headers=admin_h(), timeout=10,
                   json={"summary": "写进半成品里会被压缩覆盖掉"})
-    assert r.status_code == 409 and "半成品" in r.json()["error"]["message"]
+    assert r.status_code == 409 and "中间存档" in r.json()["error"]["message"]
 
 
 def test_activate_refuses_a_summary_over_cap():
@@ -1723,7 +1742,7 @@ def test_cancel_without_a_running_task_is_409():
     assert post("mm", convo(30)).status_code == 200
     cid = sessions()[0]["conv_id"]
     r = httpx.post(f"{PROXY}/admin/session/{cid}/cancel", headers=admin_h(), timeout=5)
-    assert r.status_code == 409 and "没有正在跑的压缩" in r.json()["error"]["message"]
+    assert r.status_code == 409 and "没有正在执行的压缩" in r.json()["error"]["message"]
 
 
 # ---- 控制台：模型与供应商配置 ----
@@ -1761,6 +1780,10 @@ def test_models_endpoint_masks_keys():
     assert d["summary"]["model"] == "mock-summary"
     assert "sk-summary" not in json.dumps(d, ensure_ascii=False), "真 key 一个字都不能回显"
     assert d["summary"]["max_tokens_field"] == "max_tokens"
+    editable = {"base_url", "model", "summary_max_tokens", "max_tokens_field",
+                "timeout_seconds", "max_attempts", "min_output_tokens", "extra_body"}
+    assert editable <= d["summary"].keys()
+    assert editable <= d["fallback"].keys()
 
 
 def test_save_models_writes_config_and_keeps_masked_keys():
@@ -1792,7 +1815,7 @@ def test_save_models_rejects_a_broken_endpoint():
     ctl(strict_body=True)
     r = _save_models(body)
     assert r.status_code == 400, r.text
-    assert "验证没通过" in r.json()["error"]["message"]
+    assert "验证未通过" in r.json()["error"]["message"]
     failed = [c for c in r.json()["checks"] if c["verdict"] == "failed"]
     assert failed and "Unrecognized request argument" in failed[0]["raw"]
     # 没写进文件
@@ -1817,7 +1840,7 @@ def test_test_endpoint_flags_a_gateway_error_delivered_as_200():
     assert d["verdict"] == "suspect", d
     assert "池子" in d["suspect"] or "没有可用" in d["suspect"], d["suspect"]
     assert "池子中没有可用账号" in d["content"], "模型输出要原样给用户看"
-    assert "中转站" in d["advice"]
+    assert "网关" in d["advice"]
 
 
 def test_test_endpoint_flags_an_html_error_page():
@@ -1861,8 +1884,20 @@ def test_dialect_detection_finds_max_completion_tokens_only_upstream():
     d = _test_model({"base_url": f"{MOCK}/v1", "api_key": "k", "model": "mock-chat",
                      "detect_dialect": True}).json()
     base = next(r for r in d["results"] if r["name"] == "baseline")
-    assert base["ok"] is False and "max_completion_tokens" in base["note"]
-    assert "探测中止" in " ".join(d["notes"]), d["notes"]
+    max_tokens = next(r for r in d["results"] if r["name"] == "max_tokens")
+    max_completion = next(
+        r for r in d["results"] if r["name"] == "max_completion_tokens")
+    assert base["ok"] is True
+    assert "max_tokens" not in base["request_body"]
+    assert "max_completion_tokens" not in base["request_body"]
+    assert max_tokens["ok"] is False
+    assert max_tokens["request_body"]["max_tokens"] == 16
+    assert "max_completion_tokens" not in max_tokens["request_body"]
+    assert max_completion["ok"] is True
+    assert max_completion["request_body"]["max_completion_tokens"] == 16
+    assert "max_tokens" not in max_completion["request_body"]
+    assert d["max_tokens_field"] == "max_completion_tokens"
+    assert "探测中止" not in " ".join(d["notes"]), d["notes"]
 
 
 def test_dialect_detection_reports_permissive_gateways():
@@ -1872,7 +1907,56 @@ def test_dialect_detection_reports_permissive_gateways():
                      "detect_dialect": True}).json()
     assert d["dialect"] == "permissive", d
     assert any("不校验未知字段" in n or "不等于" in n for n in d["notes"]), d["notes"]
-    assert d["thinking_off"] == {"reasoning_effort": "minimal"}
+    assert d["thinking_off"] is None
+    assert d["suggested_extra_body"] is None
+    assert d["thinking_off_evidence"] is None
+    assert any("不自动填写" in n for n in d["notes"]), d["notes"]
+
+
+def test_dialect_detection_autofills_the_value_that_really_disables_reasoning():
+    fresh()
+    ctl(strict_body=False,
+        reasoning_for_values={"reasoning_effort": ["minimal"]})
+    d = _test_model({"base_url": f"{MOCK}/v1", "api_key": "k", "model": "mock-chat",
+                     "detect_dialect": True}).json()
+    minimal = next(r for r in d["results"] if r["name"] == "reasoning_effort=minimal")
+    none = next(r for r in d["results"] if r["name"] == "reasoning_effort=none")
+    assert minimal["ok"] and minimal["has_reasoning"]
+    assert none["ok"] and not none["has_reasoning"]
+    assert d["dialect"] == "permissive"
+    assert d["thinking_off"] == {"reasoning_effort": "none"}
+    assert d["suggested_extra_body"] == {"reasoning_effort": "none"}
+    assert d["thinking_off_evidence"] == "response_difference"
+    assert any("实际输出差异" in n and "关闭思考参数生效" in n for n in d["notes"])
+
+
+def test_probe_result_contains_readable_fields_and_nested_raw_payload_data():
+    fresh()
+    d = _test_model({"base_url": f"{MOCK}/v1", "api_key": "k", "model": "mock-chat",
+                     "extra_body": {"temperature": 0.3}}).json()
+    assert d["input"] == "回答一个字：好"
+    assert d["request_body"]["temperature"] == 0.3
+    assert "messages" not in d["request_body"]
+    assert d["request_payload"]["messages"][0]["content"] == d["input"]
+    assert d["raw"] and d["content"]
+
+
+def test_save_validation_uses_each_endpoint_extra_body():
+    fresh(fallback=FALLBACK)
+    d = _models()
+    body = _draft_from(d)
+    body["providers"][0]["extra_body"] = {"temperature": 0.31, "seed": 11}
+    body["summary"]["extra_body"] = {"temperature": 0.21, "top_p": 0.81}
+    body["fallback"]["extra_body"] = {"temperature": 0.11, "seed": 22}
+    r = _save_models(body)
+    assert r.status_code == 200, r.text
+    checks = {c["label"]: c for c in r.json()["checks"]}
+    assert checks["provider:mm"]["request_body"]["temperature"] == 0.31
+    assert checks["provider:mm"]["request_body"]["seed"] == 11
+    assert checks["summary"]["request_body"]["temperature"] == 0.21
+    assert checks["summary"]["request_body"]["top_p"] == 0.81
+    assert checks["fallback"]["request_body"]["temperature"] == 0.11
+    assert checks["fallback"]["request_body"]["seed"] == 22
 
 
 def test_summary_uses_the_configured_max_tokens_field():
@@ -1903,7 +1987,7 @@ def test_save_models_validates_names_and_protected_keys():
     bad = _draft_from(d)
     bad["fallback"] = {"enabled": True, "base_url": "", "model": "", "api_key": ""}
     r = _save_models(bad)
-    assert r.status_code == 400 and "填全" in r.json()["error"]["message"]
+    assert r.status_code == 400 and "完整填写" in r.json()["error"]["message"]
 
 
 def test_add_a_provider_from_the_console():

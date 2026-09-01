@@ -23,9 +23,18 @@ fi
 
 if [ -x "venv/bin/python" ] && venv/bin/python -c "import httpx" 2>/dev/null; then
   PY="venv/bin/python"
-else
+elif [ -x "venv/Scripts/python.exe" ] && venv/Scripts/python.exe -c "import httpx" 2>/dev/null; then
+  PY="venv/Scripts/python.exe"
+elif command -v python3 >/dev/null 2>&1; then
   PY="python3"
+elif command -v python >/dev/null 2>&1; then
+  PY="python"
+else
+  echo "未找到可用的 Python 解释器" >&2
+  exit 1
 fi
+# 保证 Windows Git Bash 与 Linux 下的 JSON、提示文本都使用 UTF-8。
+export PYTHONUTF8="${PYTHONUTF8:-1}"
 
 _pid() {
   pgrep -f "proxy.py" 2>/dev/null | while read -r p; do
@@ -43,7 +52,7 @@ _api() { # _api METHOD PATH [DATA]
       -d "$d" "http://127.0.0.1:$PORT$p"
   else
     curl -s -X "$m" -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT$p"
-  fi | python3 -m json.tool 2>/dev/null || echo "(请求失败或服务未运行)"
+  fi | "$PY" -m json.tool 2>/dev/null || echo "(请求失败或服务未运行)"
 }
 
 case "${1:-status}" in
@@ -87,7 +96,7 @@ case "${1:-status}" in
     _api GET "/admin/session/$2"
     ;;
   ui-token)
-    python3 -c "import secrets,string; a=string.ascii_letters+string.digits; print(''.join(secrets.choice(a) for _ in range(16)))"
+    "$PY" -c "import secrets,string; a=string.ascii_letters+string.digits; print(''.join(secrets.choice(a) for _ in range(16)))"
     echo "把它填进 config.yaml 的 server.ui_token，然后 $0 reload；页面地址 http://<服务器IP>:$PORT/ui" >&2
     ;;
   summary)
@@ -103,7 +112,7 @@ case "${1:-status}" in
     trap 'rm -f "$tmp" "$tmp.orig" "$tmp.meta" "$tmp.json"' EXIT
     curl -s -H "Authorization: Bearer $TOKEN" \
       "http://127.0.0.1:$PORT/admin/session/$2/summary" > "$tmp.meta"
-    python3 - "$tmp.meta" "$tmp" <<'PY' || exit 1
+    "$PY" - "$tmp.meta" "$tmp" <<'PY' || exit 1
 import json, sys
 raw = open(sys.argv[1], encoding="utf-8").read()
 try:
@@ -126,7 +135,7 @@ PY
     cp "$tmp" "$tmp.orig"
     "${EDITOR:-vi}" "$tmp"
     if cmp -s "$tmp" "$tmp.orig"; then echo "内容没有变化，未提交"; exit 0; fi
-    python3 - "$tmp.meta" "$tmp" > "$tmp.json" <<'PY' || exit 1
+    "$PY" - "$tmp.meta" "$tmp" > "$tmp.json" <<'PY' || exit 1
 import json, sys
 d = json.loads(open(sys.argv[1], encoding="utf-8").read())
 print(json.dumps({"summary": open(sys.argv[2], encoding="utf-8").read(),
@@ -134,7 +143,7 @@ print(json.dumps({"summary": open(sys.argv[2], encoding="utf-8").read(),
 PY
     curl -s -X PUT -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
       --data-binary @"$tmp.json" \
-      "http://127.0.0.1:$PORT/admin/session/$2/summary" | python3 -m json.tool
+      "http://127.0.0.1:$PORT/admin/session/$2/summary" | "$PY" -m json.tool
     ;;
   clean)
     [ -z "${2:-}" ] && { echo "用法: $0 clean all | $0 clean <conv_id 前几位>"; exit 1; }

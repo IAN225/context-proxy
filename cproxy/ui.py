@@ -80,6 +80,21 @@ nav button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
 .msg.err{background:#fde8e8;color:#8f1d1d}
 .msg.ok{background:#dcf5e3;color:#14532d}
 @media (prefers-color-scheme:dark){.msg.err{background:#3a1b1b;color:#fca5a5}.msg.ok{background:#12301e;color:#86efac}}
+#msg{position:fixed;left:50%;bottom:calc(12px + var(--safe-b));z-index:20;
+     width:min(876px,calc(100% - 24px));transform:translateX(-50%);pointer-events:none}
+#msg .msg{margin:0;box-shadow:0 10px 30px rgba(0,0,0,.18)}
+
+.probe-list{display:grid;gap:9px;margin-top:8px}
+.probe-card{border:1px solid var(--line);border-radius:10px;background:var(--dim);padding:11px}
+.probe-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.probe-grid{display:grid;gap:8px}
+.probe-block{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:9px 10px}
+.probe-label{display:block;color:var(--muted);font-size:11.5px;margin-bottom:3px}
+.probe-value{white-space:pre-wrap;word-break:break-word;margin:0}
+.probe-raw{margin-top:8px}
+.probe-raw summary,.probe-results>summary{cursor:pointer;color:var(--muted);padding:5px 0}
+.probe-raw pre{margin:6px 0 0;padding:9px;background:var(--card);border:1px solid var(--line);
+               border-radius:8px;white-space:pre-wrap;word-break:break-all;max-height:240px;overflow:auto}
 
 /* 时间轴 */
 .tl{margin:0;padding:0;list-style:none}
@@ -134,7 +149,7 @@ nav button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
     <div id="pane_s">
       <div class="card"><div id="health" class="stats"></div></div>
       <div id="rows"></div>
-      <p id="empty" class="muted small hide">还没有会话——对话超过 trigger_tokens 触发第一次压缩后才会建档。</p>
+      <p id="empty" class="muted small hide">暂无会话。对话首次超过 trigger_tokens 并触发压缩后才会建立记录。</p>
     </div>
 
     <!-- 会话详情 -->
@@ -148,7 +163,7 @@ nav button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
       <div class="card">
         <h2 style="margin-bottom:4px">存档位</h2>
         <p class="muted small" style="margin:0 0 10px">
-          每条 checkpoint 就是一个存档。点一条载入下面的编辑区；
+          每条 checkpoint 对应一个存档。选择存档后会载入下方编辑区；
           <b>「设为生效」只换摘要内容，压缩进度不会倒退</b>——压到哪条是进度，
           摘要写了什么是内容，两件事分开。
         </p>
@@ -162,7 +177,7 @@ nav button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
         </div>
         <div id="ed_gap"></div>
         <textarea id="sum" rows="14" spellcheck="false" oninput="on_edit()"></textarea>
-        <p class="muted small" style="margin:9px 0 6px">保存到哪里（<b>必须先选一个</b>）：</p>
+        <p class="muted small" style="margin:9px 0 6px">保存目标（<b>必须选择一项</b>）：</p>
         <div id="targets" class="row" style="gap:6px"></div>
         <div class="row" style="margin-top:12px">
           <button onclick="reload_summary()">放弃修改</button>
@@ -177,13 +192,13 @@ nav button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
           <h2>本次请求：进来 → 发出去</h2><span class="spacer"></span>
           <button class="ghost small" onclick="load_timeline()">加载</button>
         </div>
-        <div id="tlbox"><p class="muted small" style="margin:0">点「加载」看最近一次请求的对比与时间轴。</p></div>
+        <div id="tlbox"><p class="muted small" style="margin:0">选择「加载」可查看最近一次请求的输入、输出与时间轴。</p></div>
       </div>
 
       <div class="card">
         <button class="danger" style="width:100%" onclick="wipe()">清除这个会话的压缩状态</button>
         <p class="muted small" style="margin:8px 0 0">
-          清掉之后下次对话会从第 0 条开始全量重压，很贵。只在状态彻底乱了时用。
+          清除后，下次对话会从第 0 条开始全量重新压缩，并产生较高调用成本。仅在压缩状态异常时使用。
         </p>
       </div>
     </div>
@@ -195,7 +210,7 @@ nav button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
     <div id="pane_c" class="hide">
       <div class="card">
         <div class="row" style="margin-bottom:8px">
-          <h2>正在跑的压缩任务</h2><span class="spacer"></span>
+          <h2>正在执行的压缩任务</h2><span class="spacer"></span>
           <button class="ghost small" onclick="load_tasks()">刷新</button>
         </div>
         <div id="tasks"><p class="muted small" style="margin:0">加载中…</p></div>
@@ -220,7 +235,6 @@ const num = n => (n == null ? "-" : String(n));
 function note(text, kind, box) {
   const el = $(box || "msg");
   el.innerHTML = text ? `<div class="msg ${kind || "err"}">${esc(text)}</div>` : "";
-  if (text && !box) el.scrollIntoView({block: "nearest", behavior: "smooth"});
 }
 
 async function api(path, opts) {
@@ -289,7 +303,7 @@ async function refresh() {
     $("health").innerHTML =
       stat(h.conversations, "会话") + stat(h.checkpoints, "checkpoint") +
       stat(busy, "正在压缩", busy ? "var(--warn)" : null) +
-      stat(todo, "没压完", todo ? "var(--warn)" : null) +
+      stat(todo, "未完成", todo ? "var(--warn)" : null) +
       stat(fb, "定位兜底", fb ? "var(--danger)" : null) +
       stat(h.trigger_tokens, "触发阈值") +
       stat(h.keep_recent_tokens_effective, "近期原文下限");
@@ -313,7 +327,7 @@ async function open_session(cid) {
     const s = await api("/admin/session/" + cid + "/summary");
     CUR = cid; D = d; LIVE = s; TL = null; TL_SHOWN = 0;
     $("pane_s").classList.add("hide"); $("pane_d").classList.remove("hide");
-    $("tlbox").innerHTML = '<p class="muted small" style="margin:0">点「加载」看最近一次请求的对比与时间轴。</p>';
+    $("tlbox").innerHTML = '<p class="muted small" style="margin:0">选择「加载」可查看最近一次请求的输入、输出与时间轴。</p>';
     $("d_id").textContent = s.conv_id;
     $("d_stats").innerHTML =
       stat(s.round_upto + " / " + s.total_rounds, "已压缩轮次") +
@@ -322,7 +336,7 @@ async function open_session(cid) {
       stat(s.base_seq, "生效档 seq") +
       (s.busy ? stat("压缩中", "暂不可保存", "var(--warn)") : "") +
       (s.unfinished_event_seq != null
-        ? stat("seq " + s.unfinished_event_seq, "上次没压完", "var(--warn)") : "");
+        ? stat("seq " + s.unfinished_event_seq, "上次未完成", "var(--warn)") : "");
     render_slots();
     load_slot(s.base_seq, true);
   } catch (e) { note(e.message); }
@@ -341,7 +355,7 @@ function render_slots() {
           <span class="pill ${c.kind === "manual" ? "on" : c.kind === "fallback" ? "bad" : ""}">${esc(c.kind)}</span>
           ${isLive ? '<span class="pill on">生效中</span>' : ""}
           ${c.pinned === 2 ? '<span class="pill on">手工固定</span>' : c.pinned ? '<span class="pill">置顶</span>' : ""}
-          ${c.status === "partial" ? '<span class="pill warn">没压完</span>' : ""}
+          ${c.status === "partial" ? '<span class="pill warn">未完成</span>' : ""}
           ${c.status === "stale" ? '<span class="pill">已作废</span>' : ""}</div>
         <div class="meta">摘要覆盖到第 ${c.round_upto} 轮 · ${c.summary_tokens} tokens ·
           ${new Date(c.updated_at * 1000).toLocaleString()}</div>
@@ -357,7 +371,7 @@ function render_slots() {
 }
 
 async function load_slot(seq, silent) {
-  if (DIRTY && !silent && !confirm("编辑区有没保存的改动，载入别的存档会丢掉。继续？")) return;
+  if (DIRTY && !silent && !confirm("编辑区包含未保存的修改。载入其他存档将丢弃这些修改，是否继续？")) return;
   try {
     const c = await api(`/admin/session/${CUR}/checkpoint/${seq}`);
     SLOT = seq; TARGET = null; DIRTY = false;
@@ -390,12 +404,12 @@ function render_targets() {
   const busy = LIVE && LIVE.busy;
   $("savebtn").disabled = !TARGET || busy;
   $("sumhint").textContent = busy
-    ? "这个会话此刻有请求在跑，等它结束再改。"
-    : (!TARGET ? "先选一个保存目标，保存按钮才会亮。"
+    ? "该会话当前有请求正在执行，请在请求结束后修改。"
+    : (!TARGET ? "请选择保存目标。完成选择后，保存按钮将变为可用状态。"
        : TARGET.kind === "new"
          ? "会新建一条存档并设为生效；压缩进度不变，后续压缩在这份内容之后追加。"
-         : `只把正文写回存档 ${SLOT}，不改变谁生效`
-           + (SLOT === live_seq() ? "（它本来就是生效档，所以立刻生效）。" : "。"));
+         : `仅将正文写入存档 ${SLOT}，不更改当前生效存档`
+           + (SLOT === live_seq() ? "（该存档当前已生效，因此修改会立即生效）。" : "。"));
 }
 
 function pick_target(k) { TARGET = {kind: k}; render_targets(); }
@@ -427,7 +441,7 @@ async function save() {
       const r = await api(`/admin/session/${CUR}/checkpoint/${SLOT}`, {
         method: "PUT", body: JSON.stringify({summary: text})
       });
-      msg = `已写回存档 ${SLOT}（${r.summary_tokens} tokens）。${r.note}`;
+      msg = `已写入存档 ${SLOT}（${r.summary_tokens} tokens）。${r.note}`;
     }
     DIRTY = false; TARGET = null;
     await reopen(); note(msg, "ok");
@@ -458,7 +472,7 @@ async function activate(seq, gap) {
 }
 
 async function wipe() {
-  if (!confirm("清除这个会话的全部压缩状态？\\n下次对话会从第 0 条开始全量重压，很贵。")) return;
+  if (!confirm("确认清除该会话的全部压缩状态？\\n下次对话将从第 0 条开始全量重新压缩，并产生较高调用成本。")) return;
   try {
     await api("/admin/clean", {method: "POST", body: JSON.stringify({target: CUR})});
     back(); note("已清除", "ok");
@@ -515,14 +529,14 @@ async function load_prompts() {
     const d = await api("/admin/prompts");
     $("prompts").innerHTML =
       `<div class="card"><p class="muted small" style="margin:0">
-         保存会<b>直接写回 config.yaml</b>（只替换正文，文件里的注释原样保留，
-         原文件备份成 config.yaml.bak），保存后立即热重载，重启依然生效。
+         保存会<b>直接写入配置文件</b>（仅替换提示词正文，并保留其他配置与注释）。
+         写入前会生成备份文件，保存后立即热重载，重启后仍然生效。
        </p></div>` +
       d.prompts.map((p, i) => `
       <div class="card">
         <div class="row" style="margin-bottom:8px">
           <h2>${esc(p.label)}</h2><span class="spacer"></span>
-          ${p.overridden ? '<span class="pill warn">仅内存</span>' : '<span class="pill">config.yaml</span>'}
+          ${p.overridden ? '<span class="pill warn">仅内存</span>' : '<span class="pill">配置文件</span>'}
         </div>
         <div class="mono muted small" style="margin-bottom:6px">${esc(p.name)}${
           p.requires && p.requires.length ? " · 必须包含 " + esc(p.requires[0]) : ""}</div>
@@ -530,7 +544,7 @@ async function load_prompts() {
         <div class="row" style="margin-top:10px">
           <button onclick="reset_prompt(${i})">恢复默认</button>
           <span class="spacer"></span>
-          <button class="primary" onclick="save_prompt(${i})">保存到 config.yaml</button>
+          <button class="primary" onclick="save_prompt(${i})">保存到配置文件</button>
         </div>
       </div>`).join("");
     window._prompts = d.prompts;
@@ -547,12 +561,12 @@ async function put_prompts(body, okmsg) {
 function save_prompt(i) {
   const p = window._prompts[i];
   put_prompts({[p.name]: $("pr_" + i).value},
-              `已把「${p.label}」写回 config.yaml，下一次压缩生效。`);
+              `「${p.label}」已写入配置文件，将在下一次压缩时生效。`);
 }
 function reset_prompt(i) {
   const p = window._prompts[i];
-  if (!confirm(`把「${p.label}」恢复成内置默认值并写回 config.yaml？`)) return;
-  put_prompts({[p.name]: ""}, `「${p.label}」已恢复成默认值并写回 config.yaml。`);
+  if (!confirm(`确认将「${p.label}」恢复为内置默认值并写入配置文件？`)) return;
+  put_prompts({[p.name]: ""}, `「${p.label}」已恢复为默认值并写入配置文件。`);
 }
 
 /* ---- 控制台：压缩任务 ---- */
@@ -565,27 +579,27 @@ async function load_tasks() {
           <span class="pill warn">${esc(t.phase)}</span>
           ${t.cancelled ? '<span class="pill bad">中止中</span>' : ""}</div>
         <div class="meta">第 ${t.batch}/${t.batches} 批 · 已压到第 ${t.rounds_done}/${t.rounds_total} 轮
-          · 累积摘要 ${num(t.summary_tokens)} tokens · 已跑 ${t.elapsed_seconds}s
+          · 累积摘要 ${num(t.summary_tokens)} tokens · 已运行 ${t.elapsed_seconds}s
           ${t.models && t.models.length ? " · " + esc(t.models.join("+")) : ""}</div>
         ${t.last_summary ? `<div class="meta" style="white-space:pre-wrap;margin-top:6px;
           max-height:120px;overflow:auto">最近一批的输出：\\n${esc(t.last_summary)}</div>` : ""}
         ${t.cancelled
-          ? '<p class="muted small" style="margin:8px 0 0">已请求中止，等当前这一批压完就停。</p>'
+          ? '<p class="muted small" style="margin:8px 0 0">已提交中止请求，将在当前批次完成后停止。</p>'
           : t.conv_id ? `<button class="danger" style="width:100%;margin-top:8px"
               onclick="cancel_task('${esc(t.conv_id)}')">中止这个任务</button>` : ""}
       </div>`).join("");
-    $("tasks").innerHTML = (rows || '<p class="muted small" style="margin:0">此刻没有正在跑的压缩。</p>')
+    $("tasks").innerHTML = (rows || '<p class="muted small" style="margin:0">当前没有正在执行的压缩任务。</p>')
       + `<p class="muted small" style="margin:8px 0 0">另有 ${d.unfinished_compressions} 个会话
-         「上次没压完」——那是静止状态，下次请求会接着压，不占用资源。</p>`;
+         处于「上次未完成」状态。该状态不会占用运行资源，下次请求会从断点继续。</p>`;
   } catch (e) { note(e.message); }
 }
 
 async function cancel_task(cid) {
-  if (!confirm("中止这次压缩？\\n\\n会在当前这一批压完后停下。已完成的批次全部保留，"
-      + "下次发消息时从断点继续。这次请求多半会返回一条「压缩未完成」的提示。")) return;
+  if (!confirm("确认中止本次压缩？\\n\\n任务将在当前批次完成后停止。已完成批次会保留，"
+      + "下次请求将从断点继续；当前请求预计会返回「压缩未完成」提示。")) return;
   try {
     await api(`/admin/session/${cid}/cancel`, {method: "POST"});
-    note("已请求中止，等当前批次结束", "ok");
+    note("已提交中止请求，将在当前批次完成后停止", "ok");
     setTimeout(load_tasks, 1200);
   } catch (e) { note(e.message); }
 }
@@ -598,12 +612,58 @@ async function load_models() {
   catch (e) { note(e.message); }
 }
 
-const jstr = o => JSON.stringify(o || {}, null, 0);
+const jstr = o => JSON.stringify(o || {}, null, 2);
 
 function kv(label, id, val, ph, type) {
   return `<label class="small muted" style="display:block;margin-top:8px">${esc(label)}
     <input id="${id}" type="${type || "text"}" value="${esc(val ?? "")}"
            placeholder="${esc(ph || "")}" style="margin-top:4px"></label>`;
+}
+
+function json_kv(label, id, val, ph) {
+  return `<label class="small muted" style="display:block;margin-top:8px">${esc(label)}
+    <textarea id="${id}" rows="3" spellcheck="false" placeholder="${esc(ph || "")}"
+              style="margin-top:4px">${esc(jstr(val))}</textarea></label>`;
+}
+
+function token_field(prefix, current) {
+  return `<label class="small muted" style="display:block;margin-top:8px">token 上限字段
+    <select id="${prefix}_field" style="width:100%;margin-top:4px;min-height:42px;font-size:16px;
+            padding:10px;border-radius:9px;border:1px solid var(--line);
+            background:var(--bg);color:var(--fg)">
+      ${MODELS.max_tokens_fields.map(x =>
+        `<option value="${x}" ${x === current ? "selected" : ""}>${x}</option>`).join("")}
+    </select></label>`;
+}
+
+function summary_model_card(which, data) {
+  const prefix = which === "summary" ? "s" : "f";
+  const title = which === "summary" ? "摘要模型（主）" : "摘要模型（备用）";
+  const enabled = which === "fallback"
+    ? `<label class="small muted"><input type="checkbox" id="f_on" ${data.enabled ? "checked" : ""}
+         style="width:auto;margin-right:6px">启用</label>` : "";
+  return `<div class="card">
+    <div class="row"><h2>${title}</h2><span class="spacer"></span>${enabled}</div>
+    ${kv("base_url", prefix + "_url", data.base_url, "https://your-gateway/v1")}
+    ${kv("模型名", prefix + "_model", data.model, "摘要模型名称")}
+    ${kv("api_key（留空表示保持不变）", prefix + "_key", "",
+         data.key_from_env ? "由环境变量提供：" + data.api_key_masked : data.api_key_masked || "未配置", "password")}
+    ${kv("单次输出 token 上限", prefix + "_maxtok", data.summary_max_tokens, "2048", "number")}
+    ${kv("请求超时（秒）", prefix + "_timeout", data.timeout_seconds, "180", "number")}
+    ${kv("最大尝试次数（含首次调用）", prefix + "_att", data.max_attempts, "2", "number")}
+    ${kv("最小有效输出 token 数", prefix + "_mintok", data.min_output_tokens, "50", "number")}
+    ${json_kv("extra_body（JSON）", prefix + "_extra", data.extra_body, '{"temperature": 0.5}')}
+    ${token_field(prefix, data.max_tokens_field)}
+    <p class="muted small" style="margin:6px 0 0">
+      不同上游可能使用 max_tokens 或 max_completion_tokens。请通过「检测传参方言」确认，
+      不要根据 URL 推断。
+    </p>
+    <div class="row" style="margin-top:10px">
+      <button class="ghost small" onclick="test_one('${which}', 0, false)">测试连通性</button>
+      <button class="ghost small" onclick="test_one('${which}', 0, true)">检测传参方言</button>
+    </div>
+    <div id="${prefix}_res"></div>
+  </div>`;
 }
 
 function render_models() {
@@ -614,21 +674,20 @@ function render_models() {
         <button class="ghost small danger" onclick="del_provider(${i})">删除</button></div>
       ${kv("名称（决定 URL：/<name>/v1）", "p_name_" + i, p.name)}
       ${kv("base_url", "p_url_" + i, p.base_url, "https://your-gateway/v1")}
-      ${kv("api_key（留空 = 不改）", "p_key_" + i, "",
+      ${kv("api_key（留空表示保持不变）", "p_key_" + i, "",
            p.key_from_env ? "由环境变量提供：" + p.api_key_masked : p.api_key_masked || "未配置", "password")}
-      ${kv("extra_body（JSON）", "p_extra_" + i, jstr(p.extra_body), "{}")}
-      ${kv("测试用模型名（保存前会用它真调一次）", "p_tm_" + i, "", "如 gpt-4o-mini")}
+      ${json_kv("extra_body（JSON）", "p_extra_" + i, p.extra_body, "{}")}
+      ${kv("测试模型名（保存前会发送真实请求）", "p_tm_" + i, "", "例如 gpt-4o-mini")}
       <label class="small muted" style="display:block;margin-top:8px">
         <input type="checkbox" id="p_mm_${i}" ${p.multimodal ? "checked" : ""}
                style="width:auto;margin-right:6px">支持图片（纯文本模型必须取消勾选）</label>
       <div class="row" style="margin-top:10px">
-        <button class="ghost small" onclick="test_one('provider', ${i}, false)">测试</button>
+        <button class="ghost small" onclick="test_one('provider', ${i}, false)">测试连通性</button>
         <button class="ghost small" onclick="test_one('provider', ${i}, true)">检测传参方言</button>
       </div>
       <div id="p_res_${i}"></div>
     </div>`).join("");
 
-  const s = m.summary, f = m.fallback;
   $("models").innerHTML = `
     <div class="card">
       <div class="row" style="margin-bottom:8px"><h2>上游供应商</h2><span class="spacer"></span>
@@ -636,54 +695,20 @@ function render_models() {
       ${prov}
     </div>
 
-    <div class="card">
-      <h2 style="margin-bottom:6px">摘要模型（主）</h2>
-      ${kv("base_url", "s_url", s.base_url, "https://your-gateway/v1")}
-      ${kv("模型名", "s_model", s.model, "便宜的摘要模型")}
-      ${kv("api_key（留空 = 不改）", "s_key", "",
-           s.key_from_env ? "由环境变量提供：" + s.api_key_masked : s.api_key_masked || "未配置", "password")}
-      ${kv("单次输出上限 max_tokens", "s_maxtok", s.summary_max_tokens, "2048")}
-      ${kv("extra_body（JSON）", "s_extra", jstr(s.extra_body), '{"temperature": 0.5}')}
-      <label class="small muted" style="display:block;margin-top:8px">token 上限用哪个字段名
-        <select id="s_field" style="width:100%;margin-top:4px;min-height:42px;font-size:16px;
-                padding:10px;border-radius:9px;border:1px solid var(--line);
-                background:var(--bg);color:var(--fg)">
-          ${m.max_tokens_fields.map(x =>
-            `<option value="${x}" ${x === s.max_tokens_field ? "selected" : ""}>${x}</option>`).join("")}
-        </select></label>
-      <p class="muted small" style="margin:6px 0 0">
-        OpenAI 新模型只认 max_completion_tokens，别的只认 max_tokens。
-        <b>别按 URL 猜</b>——点「检测传参方言」问一次上游。
-      </p>
-      <div class="row" style="margin-top:10px">
-        <button class="ghost small" onclick="test_one('summary', 0, false)">测试</button>
-        <button class="ghost small" onclick="test_one('summary', 0, true)">检测传参方言</button>
-      </div>
-      <div id="s_res"></div>
-    </div>
-
-    <div class="card">
-      <div class="row"><h2>摘要模型（备）</h2><span class="spacer"></span>
-        <label class="small muted"><input type="checkbox" id="f_on" ${f.enabled ? "checked" : ""}
-          style="width:auto;margin-right:6px">启用</label></div>
-      ${kv("base_url", "f_url", f.base_url)}
-      ${kv("模型名", "f_model", f.model)}
-      ${kv("api_key（留空 = 不改）", "f_key", "", f.api_key_masked || "未配置", "password")}
-      ${kv("最多重试次数", "f_att", f.max_attempts, "3")}
-      <div id="f_res"></div>
-    </div>
+    ${summary_model_card("summary", m.summary)}
+    ${summary_model_card("fallback", m.fallback)}
 
     <div class="card">
       <p class="muted small" style="margin:0 0 10px">
-        保存前会拿这份配置<b>真调一次</b>：调不通就不写进文件（写进去下一秒对话就全挂了）。
-        每次验证是一条十几 token 的最小请求，走真实计费。
-        保存成功后写回 config.yaml 并热重载，原文件备份成 config.yaml.bak。
+        保存前会使用当前表单中的 extra_body 和其他参数发送一次真实请求。验证失败时不会修改配置文件。
+        每个端点的验证请求约使用十几 token，并按上游标准计费。
+        保存成功后会写入配置文件并立即热重载，同时生成原配置的备份文件。
       </p>
       <button class="primary" style="width:100%" onclick="save_models(false)">验证并保存</button>
       <button style="width:100%;margin-top:8px" onclick="save_models(true)">跳过验证强制保存</button>
       <div id="m_res"></div>
     </div>`;
-  // 重绘会把 #m_res 冲掉，把上一次的验证结果补回去——不然刚点完保存结果就消失了
+  // 重绘会替换 #m_res，因此需要恢复最近一次验证结果。
   if (LAST_CHECKS) render_checks(LAST_CHECKS);
 }
 
@@ -693,10 +718,7 @@ function render_checks(checks) {
     <div class="msg ${c.verdict === "ok" ? "ok" : "err"}" style="margin-top:8px">${
       esc(c.label)}：HTTP ${c.status}${c.suspect ? " ⚠️ " + esc(c.suspect) : ""}${
       c.verdict === "ok" ? "" : "\\n" + esc(c.advice || "")}</div>
-    <details><summary class="small muted" style="cursor:pointer;padding:4px 0">看模型到底吐了什么</summary>
-      <div class="mono small" style="background:var(--dim);border-radius:8px;padding:10px;
-           white-space:pre-wrap;word-break:break-all;max-height:220px;overflow:auto">${
-        esc(c.content || "")}${c.raw ? "\\n\\n原始响应：" + esc(c.raw) : ""}</div></details>`).join("");
+    ${probe_results([c])}`).join("");
 }
 
 function add_provider() {
@@ -707,8 +729,8 @@ function add_provider() {
 }
 
 function del_provider(i) {
-  if (MODELS.providers.length <= 1) return note("至少得留一个供应商");
-  if (!confirm(`删除供应商 ${MODELS.providers[i].name}？保存后 /${MODELS.providers[i].name}/v1 就不通了。`)) return;
+  if (MODELS.providers.length <= 1) return note("至少需要保留一个供应商");
+  if (!confirm(`确认删除供应商 ${MODELS.providers[i].name}？保存后 /${MODELS.providers[i].name}/v1 将停止提供服务。`)) return;
   MODELS.providers.splice(i, 1); render_models();
 }
 
@@ -731,66 +753,129 @@ function collect() {
     extra_body: parse_json("p_extra_" + i, `供应商 ${$("p_name_" + i).value} 的 extra_body`),
     test_model: $("p_tm_" + i).value.trim(),
   }));
+  const summaryModel = (prefix, base, enabled) => ({
+    ...base,
+    ...(enabled == null ? {} : {enabled}),
+    base_url: $(prefix + "_url").value.trim(),
+    model: $(prefix + "_model").value.trim(),
+    api_key: $(prefix + "_key").value.trim() || mask,
+    summary_max_tokens: Number($(prefix + "_maxtok").value) || 2048,
+    timeout_seconds: Number($(prefix + "_timeout").value) || 180,
+    max_attempts: Number($(prefix + "_att").value) || (prefix === "s" ? 2 : 3),
+    min_output_tokens: Number($(prefix + "_mintok").value) || 50,
+    max_tokens_field: $(prefix + "_field").value,
+    extra_body: parse_json(prefix + "_extra", `${prefix === "s" ? "主" : "备用"}摘要模型的 extra_body`),
+  });
   return {
     providers,
-    summary: {...M.summary, base_url: $("s_url").value.trim(), model: $("s_model").value.trim(),
-              api_key: $("s_key").value.trim() || mask,
-              summary_max_tokens: Number($("s_maxtok").value) || 2048,
-              max_tokens_field: $("s_field").value,
-              extra_body: parse_json("s_extra", "摘要模型的 extra_body")},
-    fallback: {...M.fallback, enabled: $("f_on").checked, base_url: $("f_url").value.trim(),
-               model: $("f_model").value.trim(), api_key: $("f_key").value.trim() || mask,
-               max_attempts: Number($("f_att").value) || 3},
+    summary: summaryModel("s", M.summary, null),
+    fallback: summaryModel("f", M.fallback, $("f_on").checked),
   };
 }
 
+function pretty_raw(raw) {
+  if (!raw) return "未收到 HTTP 响应";
+  try { return JSON.stringify(JSON.parse(raw), null, 2); } catch (e) { return raw; }
+}
+
+function probe_card(r) {
+  const output = r.content || (r.reasoning ? r.reasoning : "未提取到模型输出");
+  const reasoningCount = r.reasoning_chars
+    ? `${r.reasoning_chars} 字`
+    : (r.reasoning_tokens ? `${r.reasoning_tokens} tokens` : "");
+  const reasoningLabel = r.has_reasoning
+    ? `检测到思考${reasoningCount ? "：" + reasoningCount : ""}`
+    : "未检测到思考";
+  return `<div class="probe-card">
+    <div class="probe-head">
+      <b>${esc(r.name || "test")}</b>
+      <span class="pill ${r.ok ? "on" : "bad"}">HTTP ${r.status}</span>
+      ${r.retried ? '<span class="pill warn">已重试</span>' : ""}
+      <span class="pill ${r.has_reasoning ? "warn" : "on"}">${esc(reasoningLabel)}</span>
+      ${r.elapsed_ms != null ? `<span class="muted small">${esc(r.elapsed_ms)} ms</span>` : ""}
+      ${r.suspect ? `<span class="pill warn">${esc(r.suspect)}</span>` : ""}
+    </div>
+    <div class="probe-grid">
+      <div class="probe-block"><span class="probe-label">发送字段</span>
+        <pre class="probe-value mono small">${esc(jstr(r.request_body || {}))}</pre></div>
+      <div class="probe-block"><span class="probe-label">输入</span>
+        <p class="probe-value">${esc(r.input || "未记录输入")}</p></div>
+      <div class="probe-block"><span class="probe-label">输出</span>
+        <p class="probe-value">${esc(output)}</p></div>
+      ${r.note ? `<div class="probe-block"><span class="probe-label">错误信息</span>
+        <p class="probe-value">${esc(r.note)}</p></div>` : ""}
+    </div>
+    <details class="probe-raw">
+      <summary class="small">查看原始 Payload</summary>
+      <span class="probe-label">请求 Payload</span>
+      <pre class="mono small">${esc(jstr(r.request_payload || r.request_body || {}))}</pre>
+      <span class="probe-label" style="margin-top:8px">响应 Payload</span>
+      <pre class="mono small">${esc(pretty_raw(r.raw))}</pre>
+    </details>
+  </div>`;
+}
+
+function probe_results(results) {
+  return `<details class="probe-results">
+    <summary class="small">查看测试明细（${results.length} 项）</summary>
+    <div class="probe-list">${results.map(probe_card).join("")}</div>
+  </details>`;
+}
+
 function render_probe(box, d) {
-  const cls = d.verdict === "ok" ? "ok" : "err";
+  const results = d.mode === "dialect" ? d.results : [d];
+  const baselineOk = d.mode === "dialect" && results.length && results[0].ok;
+  const cls = d.verdict === "ok" || baselineOk ? "ok" : "err";
   const head = d.mode === "dialect"
     ? `传参方言：${esc(d.dialect || "?")}｜token 字段：${esc(d.max_tokens_field || "?")}`
     : `HTTP ${d.status}｜${d.verdict === "ok" ? "正常" : d.verdict === "suspect" ? "可疑" : "失败"}`;
   const notes = (d.notes || []).map(n => esc(n)).join("\\n");
-  const results = d.mode === "dialect" ? d.results : [d];
   $(box).innerHTML = `
     <div class="msg ${cls}" style="margin-top:10px">${esc(head)}${notes ? "\\n" + notes : ""}${
-      d.advice ? "\\n" + esc(d.advice) : ""}</div>
-    <details style="margin-top:-4px">
-      <summary class="small muted" style="cursor:pointer;padding:6px 0">
-        看模型到底吐了什么（原始响应 ${results.length} 条）</summary>
-      ${results.map(r => `
-        <div class="mono small" style="background:var(--dim);border-radius:8px;padding:10px;
-             margin-top:6px;white-space:pre-wrap;word-break:break-all;max-height:260px;overflow:auto">
-          <b>${esc(r.name || "test")}</b> · HTTP ${r.status}${r.retried ? " · 重试过" : ""}
-          ${r.suspect ? ` · ⚠️ ${esc(r.suspect)}` : ""}
-          ${r.request_body ? "\\n请求附加字段：" + esc(jstr(r.request_body)) : ""}
-          ${r.content ? "\\n模型输出：" + esc(r.content) : ""}
-          ${r.raw ? "\\n原始响应：" + esc(r.raw) : ""}
-          ${r.note ? "\\n" + esc(r.note) : ""}</div>`).join("")}
-    </details>`;
+      d.advice ? "\\n" + esc(d.advice) : ""}${d.applied_note ? "\\n" + esc(d.applied_note) : ""}</div>
+    ${probe_results(results)}`;
+}
+
+function apply_dialect(which, i, d, currentExtra) {
+  const prefix = which === "summary" ? "s" : "f";
+  const extraId = which === "provider" ? "p_extra_" + i : prefix + "_extra";
+  const patch = d.suggested_extra_body || d.thinking_off || null;
+  const changes = [];
+  if (patch && Object.keys(patch).length) {
+    const merged = {...currentExtra, ...patch};
+    $(extraId).value = jstr(merged);
+    if (which === "provider") MODELS.providers[i].extra_body = merged;
+    else MODELS[which].extra_body = merged;
+    changes.push("已验证参数已写入 extra_body");
+  }
+  if (which !== "provider" && d.max_tokens_field) {
+    $(prefix + "_field").value = d.max_tokens_field;
+    MODELS[which].max_tokens_field = d.max_tokens_field;
+    changes.push(`token 上限字段已设为 ${d.max_tokens_field}`);
+  }
+  d.applied_note = changes.length
+    ? changes.join("；") + "。保存前验证将使用当前表单中的 extra_body。"
+    : "未检测到可自动写入的参数，当前 extra_body 保持不变。";
 }
 
 async function test_one(which, i, dialect) {
-  const box = which === "provider" ? "p_res_" + i : "s_res";
+  const box = which === "provider" ? "p_res_" + i : (which === "summary" ? "s_res" : "f_res");
   try {
     const c = collect();
-    const t = which === "provider" ? c.providers[i] : c.summary;
+    const t = which === "provider" ? c.providers[i] : c[which];
     const model = which === "provider" ? t.test_model : t.model;
     if (!model) return note(which === "provider"
-      ? "先填「测试用模型名」——供应商侧没有默认模型，模型是客户端每次请求带的"
-      : "先填模型名");
-    $(box).innerHTML = '<p class="muted small">正在问上游…</p>';
+      ? "请填写测试模型名。供应商配置不包含默认模型，实际模型名由客户端请求提供。"
+      : "请填写模型名");
+    $(box).innerHTML = '<p class="muted small">正在发送测试请求…</p>';
     const d = await api("/admin/models/test", {method: "POST", body: JSON.stringify({
-      target: which === "provider" ? "provider:" + t.name : "summary",
+      target: which === "provider" ? "provider:" + t.name : which,
       base_url: t.base_url, api_key: t.api_key, model,
       extra_body: t.extra_body, max_tokens_field: t.max_tokens_field,
+      timeout_seconds: t.timeout_seconds,
       detect_dialect: !!dialect})});
+    if (dialect) apply_dialect(which, i, d, t.extra_body);
     render_probe(box, d);
-    if (dialect && d.thinking_off && which === "summary") {
-      const merged = {...c.summary.extra_body, ...d.thinking_off};
-      $("s_extra").value = jstr(merged);
-      if (d.max_tokens_field) $("s_field").value = d.max_tokens_field;
-      note("已把探到的关思考写法填进摘要模型的 extra_body，确认后点保存", "ok");
-    }
   } catch (e) { note(e.message); }
 }
 
@@ -798,12 +883,12 @@ async function save_models(force) {
   try {
     const body = collect();
     body.force = !!force;
-    if (force && !confirm("跳过验证直接保存？\\n配置写错的话，下一条对话就会失败。")) return;
+    if (force && !confirm("确认跳过验证并直接保存？\\n无效配置会导致后续对话请求失败。")) return;
     $("m_res").innerHTML = '<p class="muted small">正在验证…</p>';
     const r = await api("/admin/models", {method: "PUT", body: JSON.stringify(body)});
     LAST_CHECKS = r.checks || null;
     await load_models();
-    note(r.warning || `已保存并热重载（${(r.providers || []).join("、")}）`, r.warning ? "err" : "ok");
+    note(r.warning || `配置已保存并完成热重载（${(r.providers || []).join("、")}）`, r.warning ? "err" : "ok");
   } catch (e) {
     note(e.message);
     if (e.payload && e.payload.checks) render_checks(e.payload.checks);

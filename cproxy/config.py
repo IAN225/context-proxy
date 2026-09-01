@@ -671,6 +671,11 @@ def summary_endpoints() -> list[dict[str, Any]]:
             "api_key": _SECRETS["summary"],
             "model": s["model"],
             "max_attempts": max(1, int(s.get("main_max_attempts", 2))),
+            "summary_max_tokens": max(1, int(s.get(
+                "summary_max_tokens", SUMMARY_DEFAULT_MAX_TOKENS))),
+            "max_tokens_field": max_tokens_field(),
+            "timeout_seconds": max(1.0, float(s.get("timeout_seconds", 180))),
+            "min_output_tokens": max(0, int(s.get("min_output_tokens", 50))),
             "extra_body": _clean_extra_body(s.get("extra_body"), "summary", lambda *a: None),
         })
     fb = s.get("fallback") or {}
@@ -681,6 +686,15 @@ def summary_endpoints() -> list[dict[str, Any]]:
             "api_key": _SECRETS["summary_fallback"],
             "model": fb["model"],
             "max_attempts": max(1, int(fb.get("max_attempts", 3))),
+            "summary_max_tokens": max(1, int(fb.get(
+                "summary_max_tokens", s.get("summary_max_tokens", SUMMARY_DEFAULT_MAX_TOKENS)))),
+            "max_tokens_field": (str(fb.get("max_tokens_field") or max_tokens_field())
+                                 if str(fb.get("max_tokens_field") or max_tokens_field())
+                                 in MAX_TOKENS_FIELDS else "max_tokens"),
+            "timeout_seconds": max(1.0, float(fb.get(
+                "timeout_seconds", s.get("timeout_seconds", 180)))),
+            "min_output_tokens": max(0, int(fb.get(
+                "min_output_tokens", s.get("min_output_tokens", 50)))),
             # 备用模型没写 extra_body 就沿用主模型的（通常两边想关的思考是同一套）
             "extra_body": _clean_extra_body(fb.get("extra_body", s.get("extra_body")),
                                             "summary.fallback", lambda *a: None),

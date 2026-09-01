@@ -89,11 +89,14 @@ async def _one_call(ep: dict[str, Any], user_prompt: str,
         "messages": [{"role": "user", "content": user_prompt}],
     }
     # token 上限的字段名不是一家说了算：OpenAI 新模型只认 max_completion_tokens，
-    # 别的只认 max_tokens。填哪个由 summary.max_tokens_field 决定（控制台能探测出来），
+    # 别的只认 max_tokens。填哪个由当前摘要端点决定（控制台能探测出来），
     # 并且把 extra_body 里可能写着的另一个名字清掉，免得两个一起发过去被判冲突。
     for f in config.MAX_TOKENS_FIELDS:
         payload.pop(f, None)
-    payload[config.max_tokens_field()] = max_tokens
+    field = str(ep.get("max_tokens_field") or config.max_tokens_field())
+    if field not in config.MAX_TOKENS_FIELDS:
+        field = "max_tokens"
+    payload[field] = max_tokens
     to = httpx.Timeout(connect=30.0, read=timeout_s, write=timeout_s, pool=timeout_s)
     try:
         async with httpx.AsyncClient(timeout=to) as client:
@@ -142,7 +145,7 @@ async def _one_call(ep: dict[str, Any], user_prompt: str,
         raise _CallError("bad", f"摘要模型返回错误体: {emsg}")
 
     text, reasoning = _extract_text(data)
-    min_tokens = int(config.summary().get("min_output_tokens", 50))
+    min_tokens = int(ep.get("min_output_tokens", config.summary().get("min_output_tokens", 50)))
     ntok = M.text_tokens(text)
     if ntok < min_tokens:
         raise _CallError("short", f"摘要输出过短（{ntok} < {min_tokens} token，"
@@ -159,16 +162,17 @@ async def call_chain(user_prompt: str, max_tokens: int,
     endpoints = config.summary_endpoints()
     if not endpoints:
         raise SummaryFailure("config", "摘要模型未配置（summary.base_url / api_key / model 至少缺一项）")
-    timeout_s = float(config.summary().get("timeout_seconds", 180))
     attempts_log: list[str] = []
 
     for ep in endpoints:
         who = f"{ep['tag']}:{ep['model']}"
+        timeout_s = float(ep.get("timeout_seconds", config.summary().get("timeout_seconds", 180)))
+        endpoint_max_tokens = int(ep.get("summary_max_tokens", max_tokens))
         # 用 get 而不是下标：端点字典少一个字段也只该退化成"不重试"，不该炸在这里
         max_attempts = max(1, int(ep.get("max_attempts", 1)))
         for attempt in range(1, max_attempts + 1):
             try:
-                text = await _one_call(ep, user_prompt, max_tokens, timeout_s)
+                text = await _one_call(ep, user_prompt, endpoint_max_tokens, timeout_s)
                 if attempts_log:
                     log.info("%s 由 %s 第 %d 次尝试成功（此前失败：%s）",
                              label, who, attempt, "；".join(attempts_log[-3:]))

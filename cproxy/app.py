@@ -500,8 +500,8 @@ async def overwrite_checkpoint(conv_id: str, seq: int, request: Request):
                 "error": {"message": f"会话 {cid[:12]} 没有 seq={seq} 的 checkpoint"}})
         if ck["status"] == "partial":
             return JSONResponse(status_code=409, content={"error": {"message":
-                f"seq={seq} 是还没压完的半成品，下次请求会继续往它里面追加内容，"
-                "现在写回去会被覆盖。请存到别的槽位，或直接用「保存并设为生效」。"}})
+                f"seq={seq} 是尚未完成的中间存档，下次请求会继续追加内容。"
+                "当前修改可能被覆盖，请选择其他存档，或使用「保存并设为生效」。"}})
         await st.overwrite_summary(cid, int(seq), text)
         new_seq = None
         if payload.get("activate"):
@@ -576,8 +576,8 @@ async def put_prompts(request: Request):
         config.set_prompt_overrides(current)
         return {"status": "saved_in_memory_only", "written": [],
                 "overridden": sorted(current),
-                "warning": f"写 config.yaml 失败（{e}）。改动已生效，但重启后会丢；"
-                           "检查文件权限后再保存一次"}
+                "warning": f"写入配置文件失败（{e}）。修改当前已生效，但重启后不会保留；"
+                           "请检查文件权限后重新保存"}
 
     # 写进文件了，之前的内存覆盖项就该退场，否则它会一直盖住文件里的新值
     st = store.get()
@@ -587,7 +587,7 @@ async def put_prompts(request: Request):
     do_reload()
     log.warning("提示词已写回 config.yaml：%s（已备份 config.yaml.bak）", ", ".join(sorted(changed)))
     return {"status": "saved", "written": sorted(changed), "target": "config.yaml",
-            "note": "已写入配置文件并热重载，重启后依然生效；原文件备份在 config.yaml.bak"}
+            "note": "已写入配置文件并完成热重载，重启后仍然生效；原配置已生成备份文件"}
 
 
 @app.get("/admin/session/{conv_id}/timeline")
@@ -600,9 +600,9 @@ async def get_timeline(conv_id: str, request: Request):
     tl = await store.get().load_timeline(cid)
     if tl is None:
         return JSONResponse(status_code=404, content={"error": {"message":
-            "还没有快照。把 config.yaml 的 observability.capture_timeline 设为 true 并 reload，"
-            "然后这个会话再发一次消息就有了。" if not config.observability().get("capture_timeline")
-            else "这个会话在开启快照后还没有新的请求。"}})
+            "当前没有可用快照。请在配置文件中启用 observability.capture_timeline，完成热重载后"
+            "发送一条新消息。" if not config.observability().get("capture_timeline")
+            else "该会话在启用快照后尚未产生新请求。"}})
     return tl
 
 
@@ -621,8 +621,8 @@ async def admin_tasks(request: Request):
     stats = await st.stats()
     return {"running": compress.running_tasks(),
             "unfinished_compressions": stats.get("unfinished_events", 0),
-            "note": "unfinished_compressions 是「上次没压完、下次请求接着压」的静止状态，"
-                    "不是正在跑的任务"}
+            "note": "unfinished_compressions 表示上次未完成、等待下次请求继续的静止状态，"
+                    "不表示当前有任务正在执行"}
 
 
 @app.post("/admin/session/{conv_id}/cancel")
@@ -640,10 +640,10 @@ async def cancel_compression(conv_id: str, request: Request):
         return err
     if not compress.request_cancel(cid):
         return JSONResponse(status_code=409, content={"error": {"message":
-            f"会话 {cid[:12]} 此刻没有正在跑的压缩任务，没什么可中止的"}})
+            f"会话 {cid[:12]} 当前没有正在执行的压缩任务"}})
     log.warning("[%s] 收到中止请求，将在当前批次结束后停下", cid[:12])
     return {"status": "cancelling", "conv_id": cid,
-            "note": "会在当前这一批压完后停下；已完成的批次全部保留，下次请求接着压"}
+            "note": "任务将在当前批次完成后停止；已完成批次会保留，下次请求将从断点继续"}
 
 
 # ===== 控制台：模型与供应商配置 =====
@@ -706,6 +706,7 @@ async def get_models(request: Request):
             "summary_max_tokens": s.get("summary_max_tokens"),
             "max_tokens_field": config.max_tokens_field(),
             "timeout_seconds": s.get("timeout_seconds", 180),
+            "max_attempts": s.get("main_max_attempts", 2),
             "main_max_attempts": s.get("main_max_attempts", 2),
             "min_output_tokens": s.get("min_output_tokens", 50),
         },
@@ -716,7 +717,11 @@ async def get_models(request: Request):
             "has_key": "fallback" in eps,
             "key_from_env": bool(os.environ.get("SUMMARY_FALLBACK_API_KEY")),
             "max_attempts": fb.get("max_attempts", 3),
-            "extra_body": fb.get("extra_body") or None,
+            "summary_max_tokens": fb.get("summary_max_tokens", s.get("summary_max_tokens")),
+            "max_tokens_field": fb.get("max_tokens_field", config.max_tokens_field()),
+            "timeout_seconds": fb.get("timeout_seconds", s.get("timeout_seconds", 180)),
+            "min_output_tokens": fb.get("min_output_tokens", s.get("min_output_tokens", 50)),
+            "extra_body": fb.get("extra_body", s.get("extra_body") or {}),
         },
         "max_tokens_fields": list(config.MAX_TOKENS_FIELDS),
         "protected_body_keys": list(config.PROTECTED_BODY_KEYS),
@@ -746,7 +751,7 @@ async def test_model(request: Request):
     model = str(payload.get("model", "")).strip()
     if not base_url or not model:
         return JSONResponse(status_code=400, content={
-            "error": {"message": "base_url 和 model 都得填"}})
+            "error": {"message": "请完整填写 base_url 和 model"}})
     key = _resolve_key(payload.get("api_key"), _current_key_for(payload))
     extra = payload.get("extra_body") or {}
     if not isinstance(extra, dict):
@@ -794,16 +799,16 @@ def _current_key_for(payload: dict) -> str | None:
 
 def _test_advice(res: probe.ProbeResult) -> str:
     if res.suspect:
-        return (f"HTTP {res.status} 看起来成功，但{res.suspect}。"
-                "中转站常把自己的故障当成模型输出发回来——请点开下面的原始响应，"
-                "确认这确实是模型说的话，再决定保不保存。")
+        return (f"HTTP {res.status} 已返回，但检测到{res.suspect}。"
+                "部分网关会把内部错误包装为模型输出。请展开测试明细并核对原始响应，"
+                "确认结果有效后再保存配置。")
     if res.ok:
-        return "上游正常返回了内容。建议还是扫一眼下面的模型输出，确认不是一句报错。"
+        return "上游已正常返回内容。保存前请检查测试明细，确认输出不是网关错误信息。"
     if res.kind == probe.REJECT:
-        return ("上游明确拒绝了这个请求体（400/422）。多半是 extra_body 里有它不认的字段，"
-                "或者字段值不合法。照着下面的原文改。")
-    return (f"这次没问出结果（{res.status}）：限流 / 鉴权 / 上游故障都会这样，"
-            "跟你的参数不一定有关系。过一会儿再试一次。")
+        return ("上游拒绝了当前请求体（400/422）。请检查 extra_body 中的字段名称和取值，"
+                "并依据测试明细中的原始响应进行调整。")
+    return (f"本次测试未获得有效结果（HTTP {res.status}）。可能原因包括网络连接、鉴权、"
+            "限流或上游服务异常；请根据测试明细排查后重试。")
 
 
 @app.put("/admin/models")
@@ -830,7 +835,9 @@ async def put_models(request: Request):
             body = probe.build_body(target["model"], target.get("extra_body"),
                                     max_tokens_field=target.get("max_tokens_field", "max_tokens"))
             async with httpx.AsyncClient(timeout=httpx.Timeout(
-                    connect=20.0, read=60.0, write=60.0, pool=60.0)) as client:
+                    connect=20.0, read=target.get("timeout_seconds", 60.0),
+                    write=target.get("timeout_seconds", 60.0),
+                    pool=target.get("timeout_seconds", 60.0))) as client:
                 res = await probe.probe(client, url, probe.headers_for(target["api_key"]),
                                         body, target["label"])
             d = res.to_dict()
@@ -842,8 +849,8 @@ async def put_models(request: Request):
         failed = [c for c in checks if c["verdict"] == "failed"]
         if failed:
             return JSONResponse(status_code=400, content={
-                "error": {"message": "保存前的验证没通过，配置未写入。"
-                                     "改好再存，或确信没问题就带 force=true 强制保存。"},
+                "error": {"message": "保存前验证未通过，配置文件未修改。"
+                                     "请修正配置后重试；仅在确认配置有效时使用强制保存。"},
                 "checks": checks})
 
     try:
@@ -852,16 +859,16 @@ async def put_models(request: Request):
     except Exception as e:                            # noqa: BLE001
         log.error("模型配置回写 config.yaml 失败：%s", e)
         return JSONResponse(status_code=500, content={
-            "error": {"message": f"写 config.yaml 失败：{e}"}, "checks": checks})
+            "error": {"message": f"写入配置文件失败：{e}"}, "checks": checks})
     do_reload()
     log.warning("模型配置已写回 config.yaml：%d 个供应商，摘要模型 %s",
                 len(draft["providers"]), draft["summary"].get("model"))
     suspect = [c for c in checks if c["verdict"] == "suspect"]
     return {"status": "saved", "checks": checks,
             "providers": [p["name"] for p in draft["providers"]],
-            "warning": ("有端点返回了可疑内容，已按你的要求保存，但请点开原始响应确认"
+            "warning": ("部分端点返回了可疑内容。配置已保存，请展开测试明细核对原始响应"
                         if suspect else None),
-            "note": "已写入 config.yaml 并热重载；原文件备份在 config.yaml.bak"}
+            "note": "已写入配置文件并完成热重载；原配置已生成备份文件"}
 
 
 def _build_config_draft(payload: dict) -> dict:
@@ -877,11 +884,11 @@ def _build_config_draft(payload: dict) -> dict:
         if not config.NAME_RE.match(name):
             raise ValueError(f"供应商名 {name!r} 不合法：只能用字母数字下划线连字符")
         if name in seen:
-            raise ValueError(f"供应商名 {name!r} 重复了")
+            raise ValueError(f"供应商名称 {name!r} 重复")
         seen.add(name)
         base_url = str(p.get("base_url", "")).strip().rstrip("/")
         if not base_url:
-            raise ValueError(f"供应商 {name} 缺 base_url")
+            raise ValueError(f"供应商 {name} 缺少 base_url")
         key = _resolve_key(p.get("api_key"), (config.provider(name) or {}).get("api_key"))
         extra = p.get("extra_body") or {}
         if not isinstance(extra, dict):
@@ -905,7 +912,8 @@ def _build_config_draft(payload: dict) -> dict:
             if tm:
                 to_test.append({"label": f"provider:{name}", "base_url": base_url,
                                 "api_key": key, "model": tm,
-                                "extra_body": extra})
+                                "extra_body": extra,
+                                "timeout_seconds": int(p.get("timeout_seconds") or 300)})
 
     s_in = payload.get("summary") or {}
     cur_eps = {e["tag"]: e for e in config.summary_endpoints()}
@@ -919,7 +927,8 @@ def _build_config_draft(payload: dict) -> dict:
                              if str(s_in.get("max_tokens_field")) in config.MAX_TOKENS_FIELDS
                              else "max_tokens"),
         "timeout_seconds": int(s_in.get("timeout_seconds") or 180),
-        "main_max_attempts": int(s_in.get("main_max_attempts") or 2),
+        "main_max_attempts": int(s_in.get("max_attempts")
+                                  or s_in.get("main_max_attempts") or 2),
         "min_output_tokens": int(s_in.get("min_output_tokens") or 50),
         "extra_body": s_in.get("extra_body") or {},
     }
@@ -931,7 +940,8 @@ def _build_config_draft(payload: dict) -> dict:
         to_test.append({"label": "summary", "base_url": summary["base_url"],
                         "api_key": summary["api_key"], "model": summary["model"],
                         "extra_body": summary["extra_body"],
-                        "max_tokens_field": summary["max_tokens_field"]})
+                        "max_tokens_field": summary["max_tokens_field"],
+                        "timeout_seconds": summary["timeout_seconds"]})
 
     f_in = payload.get("fallback") or {}
     fallback = {
@@ -941,18 +951,28 @@ def _build_config_draft(payload: dict) -> dict:
         "api_key": _resolve_key(f_in.get("api_key"),
                                 (cur_eps.get("fallback") or {}).get("api_key")),
         "max_attempts": int(f_in.get("max_attempts") or 3),
+        "summary_max_tokens": int(f_in.get("summary_max_tokens")
+                                  or summary["summary_max_tokens"]),
+        "max_tokens_field": (str(f_in.get("max_tokens_field") or "max_tokens")
+                             if str(f_in.get("max_tokens_field") or "max_tokens")
+                             in config.MAX_TOKENS_FIELDS else "max_tokens"),
+        "timeout_seconds": int(f_in.get("timeout_seconds") or summary["timeout_seconds"]),
+        "min_output_tokens": int(f_in.get("min_output_tokens")
+                                 or summary["min_output_tokens"]),
+        "extra_body": f_in.get("extra_body") or {},
     }
-    if f_in.get("extra_body"):
-        if not isinstance(f_in["extra_body"], dict):
-            raise ValueError("备用摘要模型的 extra_body 必须是 JSON 对象")
-        fallback["extra_body"] = f_in["extra_body"]
+    if not isinstance(fallback["extra_body"], dict):
+        raise ValueError("备用摘要模型的 extra_body 必须是 JSON 对象")
+    if bad := [k for k in fallback["extra_body"] if k in config.PROTECTED_BODY_KEYS]:
+        raise ValueError(f"备用摘要模型的 extra_body 里不能出现 {bad}")
     if fallback["enabled"]:
         if not (fallback["base_url"] and fallback["model"] and fallback["api_key"]):
-            raise ValueError("启用了备用摘要模型，就得把 base_url / model / api_key 填全")
+            raise ValueError("启用备用摘要模型时，请完整填写 base_url、model 和 api_key")
         to_test.append({"label": "fallback", "base_url": fallback["base_url"],
                         "api_key": fallback["api_key"], "model": fallback["model"],
-                        "extra_body": fallback.get("extra_body") or summary["extra_body"],
-                        "max_tokens_field": summary["max_tokens_field"]})
+                        "extra_body": fallback["extra_body"],
+                        "max_tokens_field": fallback["max_tokens_field"],
+                        "timeout_seconds": fallback["timeout_seconds"]})
 
     return {"providers": providers, "summary": summary, "fallback": fallback,
             "to_test": to_test}
@@ -980,8 +1000,8 @@ async def ui_page():
     """可视化页面。ui_token 没配就整个不存在，避免无意中把后台裸奔在公网上。"""
     if not config.ui_token():
         return JSONResponse(status_code=404, content={"error": {"message":
-            "可视化页面未启用：在 config.yaml 的 server.ui_token 里设一个密钥"
-            "（./ctl.sh ui-token 可生成），然后 ./ctl.sh reload"}})
+            "可视化页面未启用：请在配置文件的 server.ui_token 中设置密钥"
+            "（可通过 ./ctl.sh ui-token 生成），然后执行 ./ctl.sh reload"}})
     return HTMLResponse(ui.PAGE)
 
 

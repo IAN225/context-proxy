@@ -213,6 +213,44 @@ def test_fallback_endpoint_has_max_attempts():
     assert eps[1]["extra_body"] == {"temperature": 0.5}, "备用没写 extra_body 时沿用主模型的"
 
 
+def test_primary_and_fallback_endpoints_expose_the_same_runtime_options():
+    path = pathlib.Path(_TMP) / "cfg_fb_symmetric.yaml"
+    path.write_text(yaml.safe_dump({
+        "providers": [{"name": "p", "base_url": "http://127.0.0.1:1/v1", "api_key": "k"}],
+        "summary": {
+            "base_url": "http://127.0.0.1:1/v1", "api_key": "k", "model": "m",
+            "persist_db": "", "summary_max_tokens": 100, "max_tokens_field": "max_tokens",
+            "timeout_seconds": 20, "main_max_attempts": 2, "min_output_tokens": 5,
+            "extra_body": {"temperature": 0.5},
+            "fallback": {
+                "enabled": True, "base_url": "http://127.0.0.1:1/v1",
+                "api_key": "k2", "model": "m2", "summary_max_tokens": 222,
+                "max_tokens_field": "max_completion_tokens", "timeout_seconds": 30,
+                "max_attempts": 4, "min_output_tokens": 7,
+                "extra_body": {"temperature": 0.2},
+            },
+        },
+    }, allow_unicode=True), encoding="utf-8")
+    old = config.CONFIG_PATH
+    config.CONFIG_PATH = str(path)
+    try:
+        config.reload()
+        primary, fallback = config.summary_endpoints()
+    finally:
+        config.CONFIG_PATH = old
+        config.reload()
+    runtime_options = {"summary_max_tokens", "max_tokens_field", "timeout_seconds",
+                       "max_attempts", "min_output_tokens", "extra_body"}
+    assert runtime_options <= primary.keys()
+    assert runtime_options <= fallback.keys()
+    assert fallback["summary_max_tokens"] == 222
+    assert fallback["max_tokens_field"] == "max_completion_tokens"
+    assert fallback["timeout_seconds"] == 30
+    assert fallback["max_attempts"] == 4
+    assert fallback["min_output_tokens"] == 7
+    assert fallback["extra_body"] == {"temperature": 0.2}
+
+
 def test_timeline_respects_retain_from_zero():
     """窗口回退到 0（还没压过，或为了保住近期原文下限退到头）时，一轮都不该标成"已折叠"。"""
     from cproxy import compress
