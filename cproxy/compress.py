@@ -59,7 +59,10 @@ class CompressionRefused(Exception):
                     f"其中近期原文 {d['retained_tokens']} tokens 是硬性保留的"
                     f"（keep_recent_tokens 有效值 {d['keep_recent_floor']}，"
                     "已按 trigger_tokens 的 50% 自动封顶），压缩不会动它。")
-        if d.get("cause") == "batch_cap":
+        if d.get("cause") == "cancelled":
+            lines.append("是你自己在控制台点的中止，不是出错。已经压完的批次都留着了，"
+                         "重发这条消息就会从断点继续。")
+        elif d.get("cause") == "batch_cap":
             lines.append(f"本次请求压了 {d.get('batches_done')}/{d.get('batches_planned')} 批就到达"
                          "单请求上限（避免一个请求跑几十分钟）。超大历史的首次压缩需要分几次请求完成。")
         elif d.get("cause") == "oversize_tail":
@@ -116,16 +119,25 @@ def conversation_lock(conv_key: str | None, conv_id: str) -> asyncio.Lock:
 # 单请求批次上限没压完、摘要模型报错、中转站返回错误页、进程重启，都会留下 partial。
 # 把它当成"压缩中"，页面就会永久显示压缩中、摘要永远不让改（这正是用户遇到的现象）。
 # 真正的"正在跑"只有进程自己知道：请求进来时登记，走完就销号。
-_INFLIGHT: dict[str, float] = {}
+_INFLIGHT: dict[str, dict[str, Any]] = {}
+
+# 被要求中止的会话（conv_id）。压缩循环在**批与批之间**检查它——
+# 不能撕掉已经落盘的批，中止只意味着"这次请求别再往下压了"。
+_CANCEL: set[str] = set()
 
 
 @contextlib.contextmanager
 def _mark_inflight(key: str):
-    _INFLIGHT[key] = time.time()
+    _INFLIGHT[key] = {"key": key, "started_at": time.time(), "conv_id": None,
+                      "phase": "定位会话", "batch": 0, "batches": 0,
+                      "rounds_done": 0, "rounds_total": 0, "last_summary": "",
+                      "models": [], "cancelled": False}
     try:
-        yield
+        yield _INFLIGHT[key]
     finally:
-        _INFLIGHT.pop(key, None)
+        task = _INFLIGHT.pop(key, None)
+        if task and task.get("conv_id"):
+            _CANCEL.discard(task["conv_id"])
 
 
 def is_busy(conv_key: str | None, conv_id: str) -> bool:
@@ -135,6 +147,37 @@ def is_busy(conv_key: str | None, conv_id: str) -> bool:
 
 def busy_count() -> int:
     return len(_INFLIGHT)
+
+
+def running_tasks() -> list[dict[str, Any]]:
+    """给控制台看的：此刻在跑的压缩任务，含进度和已产出的摘要片段。"""
+    now = time.time()
+    return [{k: v for k, v in t.items() if k != "key"} | {
+                "elapsed_seconds": round(now - t["started_at"], 1)}
+            for t in sorted(_INFLIGHT.values(), key=lambda x: x["started_at"])]
+
+
+def request_cancel(conv_id: str) -> bool:
+    """请求中止某个会话正在跑的压缩。返回是否确实有任务在跑。
+
+    只在批之间生效：已经落盘的批一条都不会撤销（撤了反而更亏——钱花了、
+    结果不要了）。中止之后这次请求多半会撞上口闸门返回 503，
+    但进度都在，下次请求接着压。
+    """
+    hits = [t for t in _INFLIGHT.values() if t.get("conv_id") == conv_id]
+    for t in hits:
+        t["cancelled"] = True      # 立刻反映到 /admin/tasks，别等下一个批次边界
+    if hits:
+        _CANCEL.add(conv_id)
+    return bool(hits)
+
+
+def _cancel_requested(conv_id: str | None) -> bool:
+    return bool(conv_id) and conv_id in _CANCEL
+
+
+class CompressionCancelled(Exception):
+    """用户从控制台中止了这次压缩。已落盘的批全部保留。"""
 
 
 # ===== 组装 =====
@@ -262,13 +305,14 @@ async def prepare(messages: list[dict], provider: dict[str, Any],
     key = M.conv_key(body)
     # 登记整段持锁期间：管理接口据此判断"现在改摘要会不会和请求打架"。
     # 透传请求也算在内，但它只占几毫秒，不会像 partial 那样把页面卡死。
-    with _mark_inflight(key):
+    with _mark_inflight(key) as task:
         async with _lock_for(key):
-            return await _prepare_locked(head, body, key, provider, on_event)
+            return await _prepare_locked(head, body, key, provider, on_event, task)
 
 
 async def _prepare_locked(head: list[dict], body: list[dict], key: str,
-                          provider: dict[str, Any], on_event: OnEvent | None) -> Prepared:
+                          provider: dict[str, Any], on_event: OnEvent | None,
+                          task: dict[str, Any] | None = None) -> Prepared:
     s = config.summary()
     st = store.get()
     t0 = time.time()
@@ -309,6 +353,9 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
             located, match_mode = cand, mode
 
     conv_id = located.conv_id or empty_conv_id
+    if task is not None:
+        task.update({"conv_id": conv_id, "phase": "已定位，等阈值判定",
+                     "rounds_total": total_rounds})
     already = max(0, min(located.already, len(body)))
     prev_summary = located.summary or ""
     is_fallback = located.mode == "fallback"
@@ -433,9 +480,26 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
     used_models: list[str] = []
     failure: summarizer.SummaryFailure | None = None
 
+    if task is not None:
+        # conv_id 这里再写一次：新会话是在上面几行才建档的，定位阶段那次记的还是 None，
+        # 而控制台要拿 conv_id 才能对上"中止哪个会话"
+        task.update({"conv_id": conv_id, "phase": "压缩中", "batch": 0, "batches": len(todo),
+                     "batches_planned": planned, "rounds_done": M.rounds_before(rounds, already)})
+
+    cancelled = False
     for bi, (bs, be) in enumerate(todo):
+        # 中止只在批与批之间生效：已落盘的批一条都不撕——钱已经花了，结果留着有用
+        if _cancel_requested(conv_id):
+            cancelled = True
+            if task is not None:
+                task["cancelled"] = True
+            log.warning("[%s] 压缩被手工中止：已完成 %d/%d 批，进度保留到第 %d 轮 / 下标 %d",
+                        conv_id[:12], bi, len(todo), M.rounds_before(rounds, done_upto), done_upto)
+            break
         if on_event:
             await on_event("compress", bi + 1, len(todo))
+        if task is not None:
+            task.update({"batch": bi + 1})
         batch_in = M.tokens_of(infos, bs, be)
         try:
             text, model = await summarizer.summarize_batch(body[bs:be])
@@ -450,12 +514,16 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
         round_upto = M.rounds_before(rounds, be)
         await st.flush(ckpt_id, summary_text, be, round_upto)      # 摘要 + 位置同事务落盘
         used_models.append(model)
+        if task is not None:
+            task.update({"rounds_done": round_upto, "last_summary": text.strip()[:1200],
+                         "models": sorted(set(used_models)),
+                         "summary_tokens": M.text_tokens(summary_text)})
         log.info("[%s] 第 %d/%d 批完成：%s（下标 %d~%d，%d 条）｜输入 %d tokens → 输出 %d tokens"
                  "｜累积摘要 %d tokens｜模型 %s｜已落盘至第 %d 轮",
                  conv_id[:12], bi + 1, len(todo), _round_span(rounds, bs, be), bs, be, be - bs,
                  batch_in, M.text_tokens(text), M.text_tokens(summary_text), model, round_upto)
 
-    completed = failure is None and len(todo) == planned
+    completed = failure is None and not cancelled and len(todo) == planned
 
     # ---- 二次重压 ----
     if completed and M.text_tokens(summary_text) > cap:
@@ -472,7 +540,16 @@ async def _prepare_locked(head: list[dict], body: list[dict], key: str,
     meta = {**base_meta, "mode": "compress", "seq": seq, "batches_planned": planned,
             "batches_done": len(used_models), "models": sorted(set(used_models)),
             "compressed_upto": done_upto, "round_upto": M.rounds_before(rounds, done_upto),
-            "summary_tokens": M.text_tokens(summary_text), "resumed": resuming}
+            "summary_tokens": M.text_tokens(summary_text), "resumed": resuming,
+            "cancelled": cancelled}
+
+    if cancelled:
+        remaining = M.tokens_of(infos, done_upto, keep_from)
+        raise CompressionRefused(
+            "压缩被手工中止（控制台）。已完成的批次全部保留，下次请求会接着压。",
+            {**meta, "total_rounds": total_rounds, "cause": "cancelled",
+             "remaining_rounds": max(0, M.rounds_before(rounds, keep_from) - meta["round_upto"]),
+             "remaining_tokens": remaining, "progress_saved": True})
 
     if failure is not None:
         remaining = M.tokens_of(infos, done_upto, keep_from)

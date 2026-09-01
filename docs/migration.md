@@ -81,6 +81,9 @@ curl -s localhost:8787/health | python3 -m json.tool
 | `/ui` 保存提示词会**写回 config.yaml** | 旧版存数据库当覆盖项。升级后第一次保存会把该条写进文件（只替换正文，注释保留，先备份 `config.yaml.bak`）；老库里的覆盖项在保存后清空 |
 | 新增 `summary.prompts.recompress` | 二次重压提示词。**旧的 `recompress_chunk` / `recompress_merge` 已合并成这一条**：旧配置里如果有 `recompress_chunk`，会自动当作 `recompress` 沿用，两个旧键被忽略，不会报错 |
 | 新增 `observability.capture_timeline` / `preview_chars` | 请求快照，供 `/ui` 画时间轴。默认关闭 |
+| 新增 `summary.max_tokens_field` | token 上限用 `max_tokens` 还是 `max_completion_tokens`（OpenAI 新模型只认后者）。默认前者；不确定就在 `/ui` 控制台点「检测传参方言」 |
+| `summary.summary_max_tokens` 默认值 2400 → 2048 | 只影响没写这一项的配置 |
+| `providers` 段可能被控制台重写 | 用 `/ui` 控制台保存模型配置时，`providers:` 整段会用 yaml 重新生成——**段内的注释会丢**（段外的、以及 `summary` 下的注释都保留）。不想被动就别用控制台改供应商，手改 config.yaml 一样生效 |
 | 新增 `server.ui_token` | 可视化页面的登录密钥，留空则页面不启用。**一旦填了它，`/admin/*` 就只认它**，`auth_token` 不再有后台权限（`ctl.sh` 会自动改用 `ui_token`） |
 | 新增 `summary.prompts.injection` | 注入给主模型的包装语，`{summary}` 是占位符 |
 | 新增 `summary.prompts.fallback_notice` | 定位兜底时追加的警告语 |

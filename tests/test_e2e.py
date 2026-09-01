@@ -145,9 +145,9 @@ def convo(rounds: int, *, start: int = 0, filler: int = 2, head: bool = True) ->
     return msgs
 
 
-def post(provider: str, messages: list[dict], **extra):
+def post(provider: str, messages: list[dict], *, timeout: float = 60, **extra):
     return httpx.post(f"{PROXY}/{provider}/v1/chat/completions", headers=HEADERS,
-                      json={"model": "mock-chat", "messages": messages, **extra}, timeout=60)
+                      json={"model": "mock-chat", "messages": messages, **extra}, timeout=timeout)
 
 
 def calls():
@@ -1541,3 +1541,380 @@ def test_probe_accepts_custom_fields_and_reports_upstream_error_text():
     assert "厂商私有字段(自定义)" in out.stdout
     # 上游的原始报错要照抄出来，不然用户不知道为什么被拒
     assert "Unrecognized request argument" in out.stdout
+
+
+# ---- 摘要内容与压缩位置解耦 ----
+
+def _two_checkpoints_apart():
+    """造出两条压缩位置不同的 checkpoint：先压一段，再把对话续长触发第二次压缩。
+
+    返回 (conv_id, 旧档, 当前生效档)。
+    """
+    fresh()
+    assert post("mm", convo(30)).status_code == 200
+    assert post("mm", convo(60)).status_code == 200          # 更长的历史 -> 第二次压缩事件
+    cid = sessions()[0]["conv_id"]
+    cks = sorted(session_detail(cid)["checkpoints"], key=lambda c: c["seq"])
+    assert len(cks) >= 2 and cks[0]["round_upto"] < cks[-1]["round_upto"], \
+        [(c["seq"], c["round_upto"]) for c in cks]
+    return cid, cks[0], cks[-1]
+
+
+
+def test_activate_keeps_compression_progress_by_default():
+    """选一条旧摘要设为生效，**压缩进度不倒退**：内容换成它的，标记还停在原处。
+
+    这是关键语义：压到第 1400 条、选了一条覆盖到第 800 条的旧摘要，
+    用户要的是"这 1400 条对应的摘要换成这份"，不是让进度退回 800 去重压。
+    """
+    cid, old, live = _two_checkpoints_apart()
+    r = _activate(cid, old["seq"])
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["rewind"] is False
+    # 位置停在原处，内容来自旧档
+    assert body["compressed_upto"] == live["compressed_upto"]
+    assert body["round_upto"] == live["round_upto"]
+    assert body["summary_covers_round"] == old["round_upto"]
+    assert body["gap_rounds"] == live["round_upto"] - old["round_upto"] > 0
+    assert "既不在这份摘要里" in body["note"], body["note"]
+
+    now = _summary_api(cid).json()
+    assert now["summary"] == _checkpoint_api(cid, old["seq"]).json()["summary"]
+    assert now["compressed_upto"] == live["compressed_upto"], "进度不能倒退"
+
+    # 后续压缩以这份摘要为基准往后追加，起点也还是原来的位置
+    # （历史要接着 convo(60) 往下长，短历史会被当成另一段对话）
+    assert post("mm", convo(70)).status_code in (200, 503)
+    after = _summary_api(cid).json()
+    assert after["summary"].startswith(old["summary_preview"][:40])
+    assert after["compressed_upto"] >= live["compressed_upto"]
+
+
+def test_activate_with_rewind_moves_the_marker_back():
+    """显式要求时才回退进度：那段原文会被重新压一遍（贵，但没有空洞）。"""
+    cid, old, live = _two_checkpoints_apart()
+    r = httpx.post(f"{PROXY}/admin/session/{cid}/checkpoint/{old['seq']}/activate",
+                   headers=admin_h(), json={"rewind": True}, timeout=10)
+    assert r.status_code == 200, r.text
+    assert r.json()["rewind"] is True and r.json()["gap_rounds"] == 0
+    now = _summary_api(cid).json()
+    assert now["compressed_upto"] == old["compressed_upto"] < live["compressed_upto"]
+
+
+def _checkpoint_api(conv_id, seq):
+    return httpx.get(f"{PROXY}/admin/session/{conv_id}/checkpoint/{seq}",
+                     headers=admin_h(), timeout=10)
+
+
+def test_overwrite_slot_does_not_change_which_one_is_live():
+    """存档位语义：写回某个格子 ≠ 让它生效，这是两个动作。"""
+    fresh()
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    live = _summary_api(cid).json()
+    assert _put_summary(cid, "## 关键事实\n第二版", base_seq=live["base_seq"]).status_code == 200
+    live2 = _summary_api(cid).json()
+    assert live2["base_seq"] == 2
+
+    # 覆盖 1 号槽位，当前生效的仍是 2 号
+    r = httpx.put(f"{PROXY}/admin/session/{cid}/checkpoint/1", headers=admin_h(), timeout=10,
+                  json={"summary": "## 关键事实\n改写过的一号档"})
+    assert r.status_code == 200 and r.json()["activated_seq"] is None
+    assert _summary_api(cid).json()["summary"] == "## 关键事实\n第二版"
+    assert "改写过的一号档" in _checkpoint_api(cid, 1).json()["summary"]
+    # 链上没有多出新条目：存档是覆盖，不是每存一次加一条
+    assert {c["seq"] for c in session_detail(cid)["checkpoints"]} == {1, 2}
+
+    # 带 activate=true 才既存又生效
+    r = httpx.put(f"{PROXY}/admin/session/{cid}/checkpoint/1", headers=admin_h(), timeout=10,
+                  json={"summary": "## 关键事实\n一号档并生效", "activate": True})
+    assert r.status_code == 200 and r.json()["activated_seq"] == 3
+    assert _summary_api(cid).json()["summary"] == "## 关键事实\n一号档并生效"
+
+
+def test_overwrite_refuses_a_partial_slot():
+    fresh(max_batches_per_request=1)
+    assert post("mm", convo(60)).status_code == 503
+    cid = sessions()[0]["conv_id"]
+    seq = _summary_api(cid).json()["base_seq"]
+    r = httpx.put(f"{PROXY}/admin/session/{cid}/checkpoint/{seq}", headers=admin_h(), timeout=10,
+                  json={"summary": "写进半成品里会被压缩覆盖掉"})
+    assert r.status_code == 409 and "半成品" in r.json()["error"]["message"]
+
+
+def test_activate_refuses_a_summary_over_cap():
+    fresh(summary_total_cap_tokens=100000)
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    big = "很长的摘要内容。" * 400
+    assert _put_summary(cid, big, base_seq=_summary_api(cid).json()["base_seq"]).status_code == 200
+    seq = _summary_api(cid).json()["base_seq"]
+    # 把 cap 调小，再去激活那条超长的：应当拦住，否则下次压缩会把它洗掉
+    fresh_cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    fresh_cfg["summary"]["summary_total_cap_tokens"] = 50
+    CFG_PATH.write_text(yaml.safe_dump(fresh_cfg, allow_unicode=True, sort_keys=False),
+                        encoding="utf-8")
+    app_module.do_reload()
+    r = _activate(cid, seq)
+    assert r.status_code == 400 and "summary_total_cap_tokens" in r.json()["error"]["message"]
+
+
+# ---- 控制台：压缩任务 ----
+
+def test_tasks_endpoint_lists_nothing_when_idle():
+    fresh(max_batches_per_request=1)
+    assert post("mm", convo(60)).status_code == 503
+    d = httpx.get(f"{PROXY}/admin/tasks", headers=admin_h(), timeout=5).json()
+    assert d["running"] == [], d
+    assert d["unfinished_compressions"] >= 1
+
+
+def test_cancel_stops_between_batches_and_keeps_progress():
+    """中止在批与批之间生效：已落盘的批全保留，没压的下次接着压。"""
+    import threading
+    fresh(max_batches_per_request=20)
+    ctl(delay_seconds=0.25)                 # 让每批慢下来，好在中途插进去
+    cid_box, done = {}, threading.Event()
+
+    def run():
+        try:
+            post("mm", convo(40), timeout=120)
+        finally:
+            done.set()
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    # 等到任务真的开始跑
+    cid = None
+    for _ in range(200):
+        d = httpx.get(f"{PROXY}/admin/tasks", headers=admin_h(), timeout=5).json()
+        run_now = [x for x in d["running"] if x.get("conv_id")]
+        if run_now and run_now[0]["batch"] >= 1:
+            cid = run_now[0]["conv_id"]
+            task = run_now[0]
+            break
+        time.sleep(0.05)
+    assert cid, "没等到压缩任务跑起来"
+    assert task["phase"] == "压缩中" and task["batches"] > 1
+    assert task["rounds_total"] == 40
+
+    r = httpx.post(f"{PROXY}/admin/session/{cid}/cancel", headers=admin_h(), timeout=5)
+    assert r.status_code == 200 and r.json()["status"] == "cancelling"
+    done.wait(120)
+
+    detail = session_detail(cid)
+    assert detail["checkpoints"], "已落盘的批次必须留着"
+    upto = sessions()[0]["compressed_upto"]
+    assert upto > 0, "中止不该把已完成的批次撕掉"
+    # 中止后没有残留的运行态
+    assert httpx.get(f"{PROXY}/admin/tasks", headers=admin_h(), timeout=5).json()["running"] == []
+
+    # 下次请求接着压，不是从 0 重来
+    ctl(delay_seconds=0)
+    for _ in range(6):
+        if post("mm", convo(40)).status_code == 200:
+            break
+    assert sessions()[0]["compressed_upto"] >= upto
+
+
+def test_cancel_without_a_running_task_is_409():
+    fresh()
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    r = httpx.post(f"{PROXY}/admin/session/{cid}/cancel", headers=admin_h(), timeout=5)
+    assert r.status_code == 409 and "没有正在跑的压缩" in r.json()["error"]["message"]
+
+
+# ---- 控制台：模型与供应商配置 ----
+
+def _models():
+    return httpx.get(f"{PROXY}/admin/models", headers=admin_h(), timeout=10).json()
+
+
+def _save_models(payload):
+    return httpx.put(f"{PROXY}/admin/models", headers=admin_h(), json=payload, timeout=60)
+
+
+def _test_model(payload):
+    return httpx.post(f"{PROXY}/admin/models/test", headers=admin_h(), json=payload, timeout=60)
+
+
+def _draft_from(d, **over):
+    """把 GET 回来的配置整理成可提交的草稿（key 用掩码占位，表示不改）。"""
+    provs = [{**p, "api_key": d["masked_placeholder"], "test_model": "mock-chat"}
+             for p in d["providers"]]
+    body = {"providers": provs,
+            "summary": {**d["summary"], "api_key": d["masked_placeholder"]},
+            "fallback": {**d["fallback"], "api_key": d["masked_placeholder"]}}
+    body.update(over)
+    return body
+
+
+def test_models_endpoint_masks_keys():
+    fresh()
+    d = _models()
+    assert [p["name"] for p in d["providers"]] == ["mm", "text"]
+    for p in d["providers"]:
+        assert p["has_key"] and "sk-up" not in json.dumps(p, ensure_ascii=False)
+        assert "***" in p["api_key_masked"]
+    assert d["summary"]["model"] == "mock-summary"
+    assert "sk-summary" not in json.dumps(d, ensure_ascii=False), "真 key 一个字都不能回显"
+    assert d["summary"]["max_tokens_field"] == "max_tokens"
+
+
+def test_save_models_writes_config_and_keeps_masked_keys():
+    fresh()
+    d = _models()
+    body = _draft_from(d)
+    body["providers"][0]["extra_body"] = {"temperature": 0.3}
+    body["summary"]["summary_max_tokens"] = 2048
+    r = _save_models(body)
+    assert r.status_code == 200, r.text
+    assert all(c["verdict"] == "ok" for c in r.json()["checks"]), r.json()["checks"]
+
+    cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    assert cfg["providers"][0]["extra_body"] == {"temperature": 0.3}
+    assert cfg["providers"][0]["api_key"] == "sk-up", "提交掩码就该沿用旧 key，不能写成掩码"
+    assert cfg["summary"]["summary_max_tokens"] == 2048
+    # 热重载后立刻生效
+    assert post("mm", convo(2)).status_code == 200
+    assert chat_calls()[-1]["extra"]["temperature"] == 0.3
+
+
+def test_save_models_rejects_a_broken_endpoint():
+    """保存前真调一次，调不通就不写——写进去的下一秒对话就全挂了。"""
+    fresh()
+    d = _models()
+    body = _draft_from(d)
+    body["summary"]["model"] = "mock-summary"
+    body["summary"]["extra_body"] = {"__cproxy_probe_nonexistent__": 1}
+    ctl(strict_body=True)
+    r = _save_models(body)
+    assert r.status_code == 400, r.text
+    assert "验证没通过" in r.json()["error"]["message"]
+    failed = [c for c in r.json()["checks"] if c["verdict"] == "failed"]
+    assert failed and "Unrecognized request argument" in failed[0]["raw"]
+    # 没写进文件
+    cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    assert not cfg["summary"].get("extra_body")
+
+    # force 可以硬存
+    body["force"] = True
+    assert _save_models(body).status_code == 200
+    cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    assert cfg["summary"]["extra_body"] == {"__cproxy_probe_nonexistent__": 1}
+
+
+def test_test_endpoint_flags_a_gateway_error_delivered_as_200():
+    """中转站把自己的报错当模型输出发回来：状态码是 200，必须标出来并给出原文。"""
+    fresh()
+    ctl(fake_success="池子中没有可用账号，请稍后再试")
+    r = _test_model({"base_url": f"{MOCK}/v1", "api_key": "k", "model": "mock-chat"})
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["status"] == 200 and d["ok"] is True
+    assert d["verdict"] == "suspect", d
+    assert "池子" in d["suspect"] or "没有可用" in d["suspect"], d["suspect"]
+    assert "池子中没有可用账号" in d["content"], "模型输出要原样给用户看"
+    assert "中转站" in d["advice"]
+
+
+def test_test_endpoint_flags_an_html_error_page():
+    fresh()
+    ctl(html_success=True)
+    d = _test_model({"base_url": f"{MOCK}/v1", "api_key": "k", "model": "mock-chat"}).json()
+    assert d["ok"] is False and d["verdict"] == "failed"
+    assert "不是 JSON" in d["note"]
+    assert "Cloudflare" in d["raw"]
+
+
+def test_save_models_refuses_a_fake_success_only_with_the_warning():
+    """可疑但 200：不拦保存（判断权在用户），但响应里必须带警告和原文。"""
+    fresh()
+    ctl(fake_success="upstream error: no available channel")
+    d = _models()
+    r = _save_models(_draft_from(d))
+    assert r.status_code == 200, r.text
+    assert r.json()["warning"], r.json()
+    assert any(c["verdict"] == "suspect" for c in r.json()["checks"])
+    assert any("no available channel" in c["content"] for c in r.json()["checks"])
+
+
+def test_dialect_detection_does_not_look_at_the_url():
+    """只看上游认不认，不看端点长什么样。"""
+    fresh()
+    ctl(strict_body=True)          # 严格网关：只认白名单里的字段
+    d = _test_model({"base_url": f"{MOCK}/v1", "api_key": "k", "model": "mock-chat",
+                     "detect_dialect": True}).json()
+    assert d["mode"] == "dialect"
+    names = [r["name"] for r in d["results"]]
+    assert "baseline" in names and "thinking=disabled" in names
+    # 这个假上游四种关思考的写法都不认
+    assert d["dialect"] == "unknown", d["notes"]
+    assert d["max_tokens_field"] == "max_tokens"
+
+
+def test_dialect_detection_finds_max_completion_tokens_only_upstream():
+    fresh()
+    ctl(reject_unknown_max_tokens=True)
+    d = _test_model({"base_url": f"{MOCK}/v1", "api_key": "k", "model": "mock-chat",
+                     "detect_dialect": True}).json()
+    base = next(r for r in d["results"] if r["name"] == "baseline")
+    assert base["ok"] is False and "max_completion_tokens" in base["note"]
+    assert "探测中止" in " ".join(d["notes"]), d["notes"]
+
+
+def test_dialect_detection_reports_permissive_gateways():
+    fresh()
+    ctl(strict_body=False)         # 宽松网关：什么都收
+    d = _test_model({"base_url": f"{MOCK}/v1", "api_key": "k", "model": "mock-chat",
+                     "detect_dialect": True}).json()
+    assert d["dialect"] == "permissive", d
+    assert any("不校验未知字段" in n or "不等于" in n for n in d["notes"]), d["notes"]
+    assert d["thinking_off"] == {"reasoning_effort": "minimal"}
+
+
+def test_summary_uses_the_configured_max_tokens_field():
+    fresh()
+    d = _models()
+    body = _draft_from(d)
+    body["summary"]["max_tokens_field"] = "max_completion_tokens"
+    body["force"] = True
+    assert _save_models(body).status_code == 200
+    assert post("mm", convo(30)).status_code == 200
+    s = summary_calls()[0]
+    assert "max_completion_tokens" in s["extra"], s["extra"]
+    assert "max_tokens" not in s["extra"], "两个字段名不能同时发过去"
+
+
+def test_save_models_validates_names_and_protected_keys():
+    fresh()
+    d = _models()
+    bad = _draft_from(d)
+    bad["providers"][0]["name"] = "有中文的名字"
+    assert _save_models(bad).status_code == 400
+
+    bad = _draft_from(d)
+    bad["providers"][0]["extra_body"] = {"messages": [{"role": "user", "content": "x"}]}
+    r = _save_models(bad)
+    assert r.status_code == 400 and "messages" in r.json()["error"]["message"]
+
+    bad = _draft_from(d)
+    bad["fallback"] = {"enabled": True, "base_url": "", "model": "", "api_key": ""}
+    r = _save_models(bad)
+    assert r.status_code == 400 and "填全" in r.json()["error"]["message"]
+
+
+def test_add_a_provider_from_the_console():
+    fresh()
+    d = _models()
+    body = _draft_from(d)
+    body["providers"].append({"name": "brand-new", "base_url": f"{MOCK}/v1",
+                              "api_key": "sk-new", "multimodal": True,
+                              "test_model": "mock-chat"})
+    r = _save_models(body)
+    assert r.status_code == 200, r.text
+    assert "brand-new" in r.json()["providers"]
+    assert post("brand-new", convo(2)).status_code == 200
+    assert chat_calls()[-1]["headers"]["authorization"] == "Bearer sk-new"

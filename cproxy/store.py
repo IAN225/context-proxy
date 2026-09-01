@@ -326,12 +326,18 @@ class Store:
                        "ORDER BY seq DESC LIMIT 1", (conv_id,))
         return _row_to_ckpt(rows[0]) if rows else None
 
-    def _add_manual_sync(self, conv_id: str, base_id: int, summary: str, keep: int,
+    def _add_manual_sync(self, conv_id: str, position_id: int, summary: str, keep: int,
                          pin: bool) -> int:
-        """把手工编辑/手工指定的摘要写成**新的** checkpoint，不覆盖原来那条。
+        """写一条新的 manual checkpoint：**摘要文本和压缩位置是两个独立的来源**。
 
-        位置信息（compressed_upto / round_upto / signature / …）整套从被编辑的那条复制过来——
-        用户只改了摘要文字，历史对齐关系没有变。原 checkpoint 留在链上，改坏了可以回退。
+        - ``summary``：摘要正文，调用方给什么就是什么（可能来自别的 checkpoint、可能是手打的）；
+        - ``position_id``：位置信息（compressed_upto / round_upto / signature / msg_count）
+          整套从这条 SQL 层面复制过来。
+
+        拆开是因为这两件事本来就正交：「压到第几条」是**进度**，「摘要写了什么」是**内容**。
+        用户挑一条旧摘要设为生效时，他要换的是内容，不是让进度倒退回去重压——
+        位置照旧取当前生效的那条，摘要取他选的那条。想连进度一起回退是另一个选项，
+        调用方把 position_id 也指到那条即可。
 
         ``pin=True`` 时额外做两件事，保证"从现在起就用这条"是真的长期生效：
 
@@ -362,7 +368,7 @@ class Store:
                     "SELECT conv_id, ?, 'sealed', 'manual', ?, ?, compressed_upto, round_upto, "
                     "total_rounds, msg_count, signature, legacy_fp, ?, ? "
                     "FROM checkpoints WHERE id = ?",
-                    (seq, 2 if pin else 0, summary, now, now, base_id))
+                    (seq, 2 if pin else 0, summary, now, now, position_id))
                 self._conn.execute(
                     "UPDATE conversations SET event_seq = ?, updated_at = ?, last_mode = 'manual' "
                     "WHERE conv_id = ?", (seq, now, conv_id))
@@ -372,6 +378,21 @@ class Store:
                 self._conn.rollback()
                 raise
         return seq
+
+    def _overwrite_summary_sync(self, conv_id: str, seq: int, summary: str) -> bool:
+        """原地改写某个槽位的摘要正文，不动它的位置信息、不动 seq、不改谁生效。
+
+        存档式编辑要的就是这个：改完存回同一个格子，而不是每存一次就往链上加一条
+        （那样 checkpoint_keep 很快会把有用的旧档挤掉）。
+        """
+        now = time.time()
+        with self._lock:
+            assert self._conn is not None
+            cur = self._conn.execute(
+                "UPDATE checkpoints SET summary = ?, updated_at = ? WHERE conv_id = ? AND seq = ?",
+                (summary, now, conv_id, seq))
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def _checkpoint_by_seq_sync(self, conv_id: str, seq: int) -> dict | None:
         rows = self._q("SELECT * FROM checkpoints WHERE conv_id = ? AND seq = ? "
@@ -545,9 +566,12 @@ class Store:
     async def open_event_checkpoint(self, conv_id: str) -> dict | None:
         return await self._call(self._open_event_ckpt_sync, conv_id)
 
-    async def add_manual_checkpoint(self, conv_id: str, base_id: int, summary: str,
+    async def add_manual_checkpoint(self, conv_id: str, position_id: int, summary: str,
                                     keep: int, *, pin: bool = False) -> int | None:
-        return await self._call(self._add_manual_sync, conv_id, base_id, summary, keep, pin)
+        return await self._call(self._add_manual_sync, conv_id, position_id, summary, keep, pin)
+
+    async def overwrite_summary(self, conv_id: str, seq: int, summary: str) -> bool | None:
+        return await self._call(self._overwrite_summary_sync, conv_id, seq, summary)
 
     async def checkpoint_by_seq(self, conv_id: str, seq: int) -> dict | None:
         return await self._call(self._checkpoint_by_seq_sync, conv_id, seq)

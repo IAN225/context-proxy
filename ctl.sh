@@ -145,10 +145,16 @@ PY
     fi
     _api POST /admin/clean "{\"target\":\"$2\"}"
     ;;
+  tasks) _api GET /admin/tasks ;;
+  cancel)
+    [ -z "${2:-}" ] && { echo "用法: $0 cancel <conv_id 前几位>"; exit 1; }
+    _api POST "/admin/session/$2/cancel"
+    ;;
+  models) _api GET /admin/models ;;
   log) tail -f "$LOG" ;;
   errlog) tail -f "$STDERR_LOG" ;;
   *)
-    echo "用法: $0 {start|stop|restart|reload|status|log|errlog|sessions|session <id>|summary <id>|edit <id>|ui-token|clean all|clean <id>}"
+    echo "用法: $0 {start|stop|restart|reload|status|log|errlog|sessions|session <id>|summary <id>|edit <id>|tasks|cancel <id>|models|ui-token|clean all|clean <id>}"
     exit 1
     ;;
 esac

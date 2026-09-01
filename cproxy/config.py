@@ -30,7 +30,10 @@ DEFAULTS: dict[str, Any] = {
         "trigger_tokens": 39200,
         "keep_recent_tokens": 19200,
         "summary_total_cap_tokens": 12800,
-        "summary_max_tokens": 2400,
+        "summary_max_tokens": 2048,
+        # token 上限的字段名：OpenAI 新模型只认 max_completion_tokens。
+        # 别按 URL 猜，用 /admin/models 的「测试」按钮探一次，探到什么填什么。
+        "max_tokens_field": "max_tokens",
         "summary_batch_tokens": 10000,
         "max_batches_per_request": 4,
         "exit_gate_ratio": 1.2,
@@ -92,6 +95,17 @@ UI_TOKEN_MIN_LEN = 16
 # extra_body 里不允许出现的键：改了它们就不是"调参"而是把压缩本身绕过去了。
 PROTECTED_BODY_KEYS = ("messages", "stream")
 
+# 摘要模型没配 extra_body 时的兜底：摘要是"照着原文复述要点"，
+# 思考没什么用还慢又贵。关思考的字段名各家不同，所以这里只留一个空模板，
+# 由 /admin/models 探测后填进去；探不出来就什么都不加（不加也能用）。
+SUMMARY_DEFAULT_MAX_TOKENS = 2048
+
+# 合法的 token 上限字段名
+MAX_TOKENS_FIELDS = ("max_tokens", "max_completion_tokens")
+
+# provider name 会进 URL，只允许这些字符
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
 # forward_headers 永远不放行的头：鉴权头必须换成供应商的 key，
 # 其余几个由 httpx 按实际请求重算，透传过去只会自相矛盾。
 BLOCKED_HEADERS = {"authorization", "host", "content-length", "content-type",
@@ -147,7 +161,7 @@ def _load_providers(cfg: dict[str, Any], warn) -> dict[str, dict[str, Any]]:
     providers: dict[str, dict[str, Any]] = {}
     for p in raw:
         name = (p.get("name") or "").strip()
-        if not name or not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+        if not name or not NAME_RE.match(name):
             raise ConfigError(f"非法的 provider name: {name!r}")
         if name in providers:
             raise ConfigError(f"重复的 provider name: {name!r}")
@@ -245,6 +259,12 @@ def reload(warn=lambda *a, **k: None) -> dict[str, Any]:
 # ===== 读取接口（全部实时取值，保证热重载生效）=====
 def cfg() -> dict[str, Any]:
     return _CONFIG
+
+
+def max_tokens_field() -> str:
+    """摘要调用该用哪个字段名发 token 上限。写错会被 OpenAI 新模型直接 400。"""
+    v = str(summary().get("max_tokens_field", "max_tokens") or "max_tokens")
+    return v if v in MAX_TOKENS_FIELDS else "max_tokens"
 
 
 def summary() -> dict[str, Any]:
@@ -348,6 +368,191 @@ def write_prompts_to_file(new_vals: dict[str, str]) -> list[str]:
         f.write(text_out)
     os.replace(tmp, path)             # 原子替换：中途断电也不会留下半个配置文件
     return changed
+
+
+def write_models_to_file(providers: list[dict[str, Any]], summary: dict[str, Any],
+                         fallback: dict[str, Any]) -> None:
+    """把控制台改好的供应商 / 摘要模型配置写回 config.yaml。
+
+    和提示词那边（只换块标量的正文）不同，这里动的是**嵌套结构**：
+    providers 是一个对象列表，摘要模型是 summary 下的十来个平级键。
+    对这种结构做逐行手术太脆，所以策略是：
+
+    - ``providers:`` **整段用 yaml 重新生成**（段前的注释保留，段内的注释会丢——
+      那一段本来就是控制台在管了，所以在段首补一行说明）；
+    - ``summary:`` 下面的标量键**逐个原地替换**（`key: value` 换值不换行位置），
+      文件里那一大片阈值注释和提示词块全都不受影响；
+    - ``summary.extra_body`` / ``summary.fallback`` 是小块结构，整块替换。
+
+    写前备份 config.yaml.bak，写后先 yaml 解析校验再原子替换。
+    """
+    path = os.path.abspath(CONFIG_PATH)
+    with open(path, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+
+    # 列表项缩进 2 格：既是原文件的写法，也让整段（含说明注释）都落在 providers 的
+    # 缩进范围内——不然下次保存时 _block_range 会在顶格的注释行上就停住，旧条目留在原地
+    lines = _replace_top_block(lines, "providers", _dump_block(
+        [_provider_node(p) for p in providers], indent=2),
+        header=["  # 这一段由 /ui 的控制台管理：手改可以，但控制台保存时会整段重写（段内注释会丢）"])
+
+    for key in ("base_url", "model", "summary_max_tokens", "max_tokens_field",
+                "timeout_seconds", "main_max_attempts", "min_output_tokens"):
+        if key in summary:
+            lines = _replace_scalar(lines, "summary", key, summary[key])
+    _set_secret_line(lines, "summary", "api_key", summary.get("api_key", ""))
+
+    lines = _replace_sub_block(lines, "summary", "extra_body",
+                               summary.get("extra_body") or {})
+    fb_node = {k: v for k, v in fallback.items() if k != "api_key"}
+    fb_node["api_key"] = fallback.get("api_key", "")
+    lines = _replace_sub_block(lines, "summary", "fallback", fb_node)
+
+    text_out = "\n".join(lines)
+    yaml.safe_load(text_out)          # 写坏了宁可抛异常，也不能把配置文件毁掉
+    try:
+        shutil.copyfile(path, path + ".bak")
+    except OSError:
+        pass
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text_out)
+    os.replace(tmp, path)
+
+
+def _provider_node(p: dict[str, Any]) -> dict[str, Any]:
+    """写进文件的 provider 节点。字段顺序固定，读起来稳定。"""
+    node: dict[str, Any] = {"name": p["name"], "base_url": p["base_url"],
+                            "api_key": p.get("api_key", "")}
+    for k in ("timeout_seconds", "connect_timeout_seconds", "multimodal"):
+        if k in p:
+            node[k] = p[k]
+    for k in ("extra_body", "forward_headers", "forward_query"):
+        if p.get(k):
+            node[k] = p[k]
+    return node
+
+
+def _dump_block(node: Any, indent: int) -> list[str]:
+    text = yaml.safe_dump(node, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    pad = " " * indent
+    return [(pad + ln).rstrip() for ln in text.rstrip("\n").split("\n")]
+
+
+def _block_range(lines: list[str], start: int, indent: int) -> int:
+    """从 start+1 起，属于这个块的行：空行、缩进更深的行，或**同缩进的序列项**。
+
+    最后那条别漏：`providers:` 下面的 `- name: ...` 按 YAML 规矩可以顶格写
+    （yaml.safe_dump 就是这么输出的），漏了它会在第一个列表项上就判定块结束，
+    旧条目留在原地，新写的插在前面，直接写出一份坏配置。
+    """
+    i = start + 1
+    while i < len(lines):
+        ln = lines[i]
+        cur = len(ln) - len(ln.lstrip(" "))
+        if ln.strip() == "" or cur > indent or (cur == indent and ln.lstrip().startswith("- ")):
+            i += 1
+            continue
+        break
+    while i - 1 > start and lines[i - 1].strip() == "":
+        i -= 1
+    return i
+
+
+def _own_comment(line: str) -> bool:
+    """是不是"属于本层键"的注释行。缩进比本层深的注释是上一个子块里的，别把它挤出来。"""
+    stripped = line.lstrip()
+    return stripped.startswith("#") and (len(line) - len(stripped)) <= 2
+
+
+def _replace_top_block(lines: list[str], key: str, body: list[str],
+                       header: list[str] | None = None) -> list[str]:
+    pat = re.compile(rf"^{re.escape(key)}\s*:\s*$")
+    start = next((i for i, ln in enumerate(lines) if pat.match(ln)), None)
+    if start is None:
+        raise ConfigError(f"config.yaml 里找不到顶层的 {key}:")
+    end = _block_range(lines, start, 0)
+    return lines[:start] + [f"{key}:"] + (header or []) + body + lines[end:]
+
+
+def _replace_scalar(lines: list[str], section: str, key: str, value: Any) -> list[str]:
+    """替换 `  key: value` 的值，**保留同一行尾部的注释**（那些注释就是文档）。"""
+    start, end = _section_range(lines, section)
+    pat = re.compile(rf"^  {re.escape(key)}\s*:")
+    for i in range(start + 1, end):
+        if pat.match(lines[i]):
+            comment = _trailing_comment(lines[i])
+            new_line = f"  {key}: {_scalar(value)}"
+            if comment:
+                # 尽量把注释对回原来的列，对不齐就退回两个空格
+                col = max(len(new_line) + 2, lines[i].index(comment))
+                new_line = new_line.ljust(col) + comment
+            lines[i] = new_line.rstrip()
+            return lines
+    # 段里没有这个键就补一行进去
+    lines.insert(_insert_point(lines, start, end), f"  {key}: {_scalar(value)}")
+    return lines
+
+
+def _insert_point(lines: list[str], start: int, end: int) -> int:
+    """新键插在哪：提示词那一大块之前。插在段末的话会跑到几十行提示词后面，读起来找不着。"""
+    for i in range(start + 1, end):
+        if re.match(r"^  prompts\s*:", lines[i]):
+            j = i
+            while j - 1 > start and (lines[j - 1].strip() == "" or _own_comment(lines[j - 1])):
+                j -= 1              # 连同它上面的注释块一起让位
+            return j
+    return end
+
+
+def _trailing_comment(line: str) -> str:
+    """取出行尾注释。值里也可能有 #，所以逐个候选位置试着解析，第一个解析得通的才算。"""
+    for m in re.finditer(r"\s#", line):
+        head = line[:m.start()]
+        try:
+            yaml.safe_load(head.strip() + "\n")
+        except yaml.YAMLError:
+            continue
+        return line[m.start() + 1:]
+    return ""
+
+
+def _set_secret_line(lines: list[str], section: str, key: str, value: str) -> None:
+    _replace_scalar(lines, section, key, value)
+
+
+def _replace_sub_block(lines: list[str], section: str, key: str, node: Any) -> list[str]:
+    """替换 `  key:` 下面那一小块结构（extra_body / fallback）。空 dict = 整块删掉。"""
+    start, end = _section_range(lines, section)
+    pat = re.compile(rf"^  {re.escape(key)}\s*:")
+    idx = next((i for i in range(start + 1, end) if pat.match(lines[i])), None)
+    if not node:
+        if idx is None:
+            return lines
+        stop = _block_range(lines, idx, 2)
+        return lines[:idx] + lines[stop:]
+    body = _dump_block(node, indent=4)
+    if idx is None:
+        at = _insert_point(lines, start, end)
+        tail = [""] if (at < len(lines) and lines[at].strip() != "") else []
+        return lines[:at] + [f"  {key}:"] + body + tail + lines[at:]
+    stop = _block_range(lines, idx, 2)
+    return lines[:idx] + [f"  {key}:"] + body + lines[stop:]
+
+
+def _section_range(lines: list[str], section: str) -> tuple[int, int]:
+    pat = re.compile(rf"^{re.escape(section)}\s*:\s*$")
+    start = next((i for i, ln in enumerate(lines) if pat.match(ln)), None)
+    if start is None:
+        raise ConfigError(f"config.yaml 里找不到顶层的 {section}:")
+    return start, _block_range(lines, start, 0)
+
+
+def _scalar(value: Any) -> str:
+    """标量的 YAML 写法。safe_dump 会给纯标量加一行文档结束符 `...`，得去掉。"""
+    text = yaml.safe_dump(value, allow_unicode=True, default_flow_style=True)
+    parts = [ln for ln in text.split("\n") if ln.strip() and ln.strip() != "..."]
+    return " ".join(parts).strip()
 
 
 def _find_prompt_line(lines: list[str], name: str) -> int | None:
