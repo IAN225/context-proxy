@@ -95,8 +95,11 @@ async def chat(request: Request):
                              for p in m["content"]) for m in msgs),
         "system_preview": next((str(m.get("content"))[:120] for m in msgs
                                 if m.get("role") == "system"), None),
+        # 代理注入的那条摘要（带 [CONTEXT_SUMMARY] 前缀），用来验证发出去的到底是哪一版
+        "injected_summary": next((str(m.get("content"))[:2000] for m in msgs
+                                  if "[CONTEXT_SUMMARY]" in str(m.get("content", ""))), None),
         # 摘要请求的 user prompt（里面是被渲染成文本的那一批原文）
-        "prompt": str(msgs[-1].get("content", ""))[:4000] if msgs else "",
+        "prompt": str(msgs[-1].get("content", ""))[:8000] if msgs else "",
         "stream": bool(body.get("stream")),
         "extra": {k: v for k, v in body.items()
                   if k not in ("model", "messages", "stream", "max_tokens")},

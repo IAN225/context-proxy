@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 import uuid
@@ -109,10 +110,40 @@ def conversation_lock(conv_key: str | None, conv_id: str) -> asyncio.Lock:
     return _lock_for(conv_key or f"cid:{conv_id}")
 
 
+# ===== 此刻真的有请求在处理的会话 =====
+# 不能拿 checkpoint 的 partial 状态回答"是不是正在压缩"：
+# partial 是"上次没压完，下次请求接着压"的**静止**状态，可能停在那里好几天——
+# 单请求批次上限没压完、摘要模型报错、中转站返回错误页、进程重启，都会留下 partial。
+# 把它当成"压缩中"，页面就会永久显示压缩中、摘要永远不让改（这正是用户遇到的现象）。
+# 真正的"正在跑"只有进程自己知道：请求进来时登记，走完就销号。
+_INFLIGHT: dict[str, float] = {}
+
+
+@contextlib.contextmanager
+def _mark_inflight(key: str):
+    _INFLIGHT[key] = time.time()
+    try:
+        yield
+    finally:
+        _INFLIGHT.pop(key, None)
+
+
+def is_busy(conv_key: str | None, conv_id: str) -> bool:
+    """这个会话此刻是否有请求正在处理（键与 conversation_lock 一致）。"""
+    return (conv_key or f"cid:{conv_id}") in _INFLIGHT
+
+
+def busy_count() -> int:
+    return len(_INFLIGHT)
+
+
 # ===== 组装 =====
 def _summary_message(summary_text: str, *, branch_warning: bool) -> dict:
     p = config.prompts()
-    body = p["injection"].replace("{summary}", summary_text.strip())
+    # 两种写法都认：新配置用 {{summary}}，和摘要提示词的 {{context}} 保持一致；
+    # 旧配置里的单花括号 {summary} 继续有效，升级不用改文件
+    body = (p["injection"].replace("{{summary}}", summary_text.strip())
+                          .replace("{summary}", summary_text.strip()))
     if branch_warning:
         body = body.rstrip() + "\n" + p["fallback_notice"].strip()
     # SUMMARY_TAG 前缀让下一轮请求能认出并剥掉自己注入的内容
@@ -229,8 +260,11 @@ async def prepare(messages: list[dict], provider: dict[str, Any],
         return Prepared(final, {"mode": "no_body", "sanitize": stats})
 
     key = M.conv_key(body)
-    async with _lock_for(key):
-        return await _prepare_locked(head, body, key, provider, on_event)
+    # 登记整段持锁期间：管理接口据此判断"现在改摘要会不会和请求打架"。
+    # 透传请求也算在内，但它只占几毫秒，不会像 partial 那样把页面卡死。
+    with _mark_inflight(key):
+        async with _lock_for(key):
+            return await _prepare_locked(head, body, key, provider, on_event)
 
 
 async def _prepare_locked(head: list[dict], body: list[dict], key: str,

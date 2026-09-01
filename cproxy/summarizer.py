@@ -74,17 +74,20 @@ def _extract_text(data: dict) -> tuple[str, str]:
     return (content or "").strip(), (reasoning or "").strip() if isinstance(reasoning, str) else ""
 
 
-async def _one_call(ep: dict[str, Any], system_prompt: str, user_prompt: str,
+async def _one_call(ep: dict[str, Any], user_prompt: str,
                     max_tokens: int, timeout_s: float) -> str:
     # extra_body 先铺底，再让本函数的固定字段覆盖它——
     # model / max_tokens 由摘要配置决定，messages / stream 是这条调用链的骨架，都不接受改写。
+    #
+    # 只发一条 user 消息：提示词和待压正文是同一段模板（{{context}} 插正文），
+    # 用户在页面上改的就是这一整段，拆成 system + 硬编码包装语的话，
+    # 包装语那部分他改不到，看到的和实际发出去的也对不上。
     payload = {
         **(ep.get("extra_body") or {}),
         "model": ep["model"],
         "max_tokens": max_tokens,
         "stream": False,
-        "messages": [{"role": "system", "content": system_prompt},
-                     {"role": "user", "content": user_prompt}],
+        "messages": [{"role": "user", "content": user_prompt}],
     }
     to = httpx.Timeout(connect=30.0, read=timeout_s, write=timeout_s, pool=timeout_s)
     try:
@@ -142,7 +145,7 @@ async def _one_call(ep: dict[str, Any], system_prompt: str, user_prompt: str,
     return text.strip()
 
 
-async def call_chain(system_prompt: str, user_prompt: str, max_tokens: int,
+async def call_chain(user_prompt: str, max_tokens: int,
                      *, label: str) -> tuple[str, str]:
     """按 [主, 备] 顺序调用，返回 (摘要文本, 实际生效的模型标识)。
 
@@ -160,7 +163,7 @@ async def call_chain(system_prompt: str, user_prompt: str, max_tokens: int,
         max_attempts = max(1, int(ep.get("max_attempts", 1)))
         for attempt in range(1, max_attempts + 1):
             try:
-                text = await _one_call(ep, system_prompt, user_prompt, max_tokens, timeout_s)
+                text = await _one_call(ep, user_prompt, max_tokens, timeout_s)
                 if attempts_log:
                     log.info("%s 由 %s 第 %d 次尝试成功（此前失败：%s）",
                              label, who, attempt, "；".join(attempts_log[-3:]))
@@ -191,11 +194,9 @@ async def call_chain(system_prompt: str, user_prompt: str, max_tokens: int,
 async def summarize_batch(batch: list[dict], depth: int = 0) -> tuple[str, str]:
     """摘要一批原文消息。遇到上下文超限就二分重投（不是重试）。"""
     s = config.summary()
-    prompt = config.prompts()["batch_system"]
-    user = ("请把下面这段对话片段压缩成结构化要点摘要：\n\n"
-            "=== 对话片段开始 ===\n" + M.render_for_summary(batch) + "\n=== 对话片段结束 ===")
+    user = config.render_prompt("batch", M.render_for_summary(batch))
     try:
-        return await call_chain(prompt, user, int(s.get("summary_max_tokens", 2400)),
+        return await call_chain(user, int(s.get("summary_max_tokens", 2400)),
                                 label=f"批次摘要({len(batch)} 条)")
     except _CallError as e:      # call_chain 只会把 context 类原样抛上来
         if e.kind != "context" or len(batch) < 2 or depth >= 3:
@@ -257,8 +258,7 @@ async def recompress(long_summary: str, on_progress: Callable | None = None) -> 
 async def _condense(text: str, depth: int = 0) -> tuple[str, str]:
     s = config.summary()
     try:
-        return await call_chain(config.prompts()["recompress"],
-                                "以下是需要精简的摘要内容：\n\n" + text,
+        return await call_chain(config.render_prompt("recompress", text),
                                 int(s.get("summary_max_tokens", 2400)),
                                 label=f"二次重压({M.text_tokens(text)} tokens)")
     except _CallError as e:

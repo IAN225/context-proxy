@@ -232,9 +232,22 @@ systemctl status context-proxy
 两个页签：
 
 - **会话** —— 列表与压缩进度、checkpoint 链、当前生效的摘要全文（可直接编辑保存），
-  以及本次请求的「进来 → 发出去」对比和对话时间轴（见下）。
-- **提示词** —— 四套提示词直接在页面上改、保存、一键恢复成 config.yaml 里的值。
-  改动存进数据库当覆盖项，**不回写 config.yaml**（回写会把文件里的注释冲掉）。
+  链上任意一条都能一键「设为当前摘要」，以及本次请求的「进来 → 发出去」对比和对话时间轴（见下）。
+- **提示词** —— 四套提示词直接在页面上改、保存、一键恢复默认。保存**直接写回 config.yaml**：
+  只替换提示词正文，文件里的注释和其余配置一字不动，写前自动备份成 `config.yaml.bak`，
+  保存后立即热重载，**重启依然生效**。
+
+### 摘要与 checkpoint 的手工干预
+
+摘要压得不好，或者想回到某一版，页面上有两个操作：
+
+- **编辑摘要**——改完保存，写成一条新的 manual checkpoint；
+- **设为当前摘要**——checkpoint 链上任意一条都能一键指定。
+
+两者都是**长期生效**的：被指定的那条会固定住（裁剪时永远保留），
+该会话所有「上次没压完」的半成品会被作废，重启之后仍然是它，
+后续压缩也在它之上继续追加，不会绕回系统自动压的某条旧 checkpoint。
+更晚的 checkpoint 照样留在链上，随时可以再选回去。
 
 安全上：
 
@@ -288,6 +301,7 @@ EDITOR=nano ./ctl.sh edit a1b2c3d4   # 拉到编辑器里改，保存即写回
 GET  /admin/session/{conv_id}/summary            # JSON，含 base_seq / token 数 / 是否可编辑
 GET  /admin/session/{conv_id}/summary?format=text # 纯文本
 PUT  /admin/session/{conv_id}/summary            # {"summary": "...", "base_seq": N}
+POST /admin/session/{conv_id}/checkpoint/{seq}/activate   # 把某条 checkpoint 设为当前摘要
 ```
 
 `/health` 里有几个值得盯的字段：
@@ -295,7 +309,8 @@ PUT  /admin/session/{conv_id}/summary            # {"summary": "...", "base_seq"
 | 字段 | 含义 |
 |---|---|
 | `fallback_activations` | 定位兜底触发次数。**长期应当为 0**，非零说明定位逻辑漏了情况，见 troubleshooting |
-| `open_compression_events` | 处于 partial 状态的压缩事件数，长期不为 0 说明有会话一直没压完 |
+| `compressing_now` | 此刻真的有请求在压缩的会话数。**这个才是"压缩中"** |
+| `unfinished_compressions` | 处于 partial（上次没压完，下次请求接着压）的事件数。它是**静止状态**，可以停留很久，不代表有请求在跑；长期不降说明有会话一直没被推进 |
 | `conversations` / `checkpoints` | 会话数与 checkpoint 总数 |
 
 ---

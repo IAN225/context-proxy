@@ -205,7 +205,9 @@ async def health():
         "legacy_migrated": st.migrated_count,
         "conversations": stats.get("conversations", 0),
         "checkpoints": stats.get("checkpoints", 0),
-        "open_compression_events": stats.get("open_events", 0),
+        # 未压完 ≠ 正在压：前者是"下次请求接着压"的静止状态，后者才是此刻真有请求在跑
+        "unfinished_compressions": stats.get("unfinished_events", 0),
+        "compressing_now": compress.busy_count(),
         # 兜底定位每触发一次都说明上面的定位逻辑漏了一种情况，这个数字应当长期为 0
         "fallback_activations": stats.get("fallback_activations", 0),
         "conversation_locks": len(compress._LOCKS),
@@ -290,16 +292,23 @@ async def get_summary(conv_id: str, request: Request, format: str = "json"):
     if format == "text":
         return PlainTextResponse(ck["summary"] or "")
     open_ev = await st.open_event_checkpoint(cid)
+    conv = await st.get_conversation(cid)
+    busy = compress.is_busy((conv or {}).get("conv_key"), cid)
     return {
         "conv_id": cid,
         "base_seq": ck["seq"],          # 回写时带上它做乐观并发校验
         "kind": ck["kind"], "status": ck["status"],
+        "pinned": ck.get("pinned", 0),
         "compressed_upto": ck["compressed_upto"], "round_upto": ck["round_upto"],
         "total_rounds": ck["total_rounds"],
         "summary_tokens": M.text_tokens(ck["summary"] or ""),
         "summary_cap_tokens": config.summary().get("summary_total_cap_tokens"),
-        "editable": open_ev is None,
-        "open_event_seq": open_ev["seq"] if open_ev else None,
+        # 能不能改，只取决于此刻有没有请求正在跑。
+        # 存在未压完的事件（partial）不是"压缩中"——那是静止状态，可能停在那儿好几天，
+        # 拿它当忙，页面就会永久不让编辑。保存时会把这些半成品作废掉。
+        "editable": not busy,
+        "busy": busy,
+        "unfinished_event_seq": open_ev["seq"] if open_ev else None,
         "summary": ck["summary"] or "",
     }
 
@@ -326,16 +335,14 @@ async def put_summary(conv_id: str, request: Request):
         return err
     st = store.get()
 
-    # 和压缩流程抢同一把会话锁，避免和正在跑的压缩交错写
+    # 和压缩流程抢同一把会话锁，避免和正在跑的压缩交错写。
+    # 拿到锁就说明没有请求在压这个会话了，不需要再看 checkpoint 是不是 partial——
+    # partial 只表示"上次没压完"，是个可以停留很久的静止状态。
     async with compress.conversation_lock((conv or {}).get("conv_key"), cid):
         ck = await st.latest_checkpoint(cid)
         if ck is None:
             return JSONResponse(status_code=404, content={
                 "error": {"message": "这个会话还没有任何 checkpoint（尚未触发过压缩）"}})
-        if ck["status"] == "partial":
-            return JSONResponse(status_code=409, content={"error": {"message":
-                f"会话正在压缩中（事件 seq={ck['seq']} 未完成），现在改会和它打架。"
-                "等这轮压完（再发一条消息推进它）再改。"}})
         base_seq = payload.get("base_seq")
         if base_seq is not None and int(base_seq) != int(ck["seq"]):
             return JSONResponse(status_code=409, content={"error": {"message":
@@ -349,22 +356,64 @@ async def put_summary(conv_id: str, request: Request):
                 f"摘要 {tokens} tokens 超过 summary_total_cap_tokens={cap}，"
                 "超了会在下次压缩时被自动二次重压、把你的改动洗掉。请精简后再存。"}})
 
-        seq = await st.add_manual_checkpoint(cid, int(ck["id"]), text,
-                                             int(config.summary().get("checkpoint_keep", 10)))
+        # pin=True：这条从此就是**当前生效**的摘要——标成不可裁剪，
+        # 并把未压完的半成品作废掉，免得下次请求绕回那条 seq 更小的继续追加
+        seq = await st.add_manual_checkpoint(
+            cid, int(ck["id"]), text, int(config.summary().get("checkpoint_keep", 10)), pin=True)
     old_tokens = M.text_tokens(ck["summary"] or "")
     log.warning("[%s] 摘要被手工改写：seq %s -> %s（%d -> %d tokens），"
-                "位置信息沿用第 %s 轮 / 下标 %s，原 checkpoint 保留可回退",
+                "位置信息沿用第 %s 轮 / 下标 %s，已置为当前摘要，原 checkpoint 保留可回退",
                 cid[:12], ck["seq"], seq, old_tokens, tokens,
                 ck["round_upto"], ck["compressed_upto"])
     return {"status": "updated", "conv_id": cid, "new_seq": seq, "base_seq": ck["seq"],
             "summary_tokens": tokens, "previous_summary_tokens": old_tokens,
-            "note": "下一次请求即生效；后续压缩会在此基础上追加"}
+            "note": "下一次请求即生效；已固定为当前 checkpoint，重启后仍然是它"}
+
+
+@app.post("/admin/session/{conv_id}/checkpoint/{seq}/activate")
+async def activate_checkpoint(conv_id: str, seq: int, request: Request):
+    """把某条历史 checkpoint 的摘要设为**当前生效**的摘要。
+
+    做法是照着它复制一条新的 manual checkpoint 放到链首（seq 最大），而不是删掉后来的：
+    后面那些照样留在链上，改错了还能再选回去。同时：
+
+    - 新的这条标成 pinned，裁剪时永远保留；
+    - 该会话所有未压完的半成品（partial）标成 stale，不再被续压。
+      否则下次请求会去续压那条 seq 更小的半成品、在它的摘要上追加，
+      表现出来就是"重启之后又变回系统自动压的那条了"。
+    """
+    if (denied := _check_auth(request, admin=True)) is not None:
+        return denied
+    cid, conv, err = await _resolve_conv(conv_id)
+    if err is not None:
+        return err
+    st = store.get()
+    async with compress.conversation_lock((conv or {}).get("conv_key"), cid):
+        target = await st.checkpoint_by_seq(cid, int(seq))
+        if target is None:
+            return JSONResponse(status_code=404, content={
+                "error": {"message": f"会话 {cid[:12]} 没有 seq={seq} 的 checkpoint"}})
+        if not (target["summary"] or "").strip():
+            return JSONResponse(status_code=400, content={
+                "error": {"message": f"seq={seq} 的摘要是空的，设为当前等于把早期记忆全丢掉"}})
+        latest = await st.latest_checkpoint(cid)
+        new_seq = await st.add_manual_checkpoint(
+            cid, int(target["id"]), target["summary"],
+            int(config.summary().get("checkpoint_keep", 10)), pin=True)
+    log.warning("[%s] 手工指定当前摘要：seq %s（%s，第 %s 轮 / 下标 %s）复制为 seq %s 并置顶；"
+                "原链首 seq=%s 保留可回退", cid[:12], target["seq"], target["kind"],
+                target["round_upto"], target["compressed_upto"], new_seq,
+                (latest or {}).get("seq"))
+    return {"status": "activated", "conv_id": cid, "from_seq": int(seq), "new_seq": new_seq,
+            "compressed_upto": target["compressed_upto"], "round_upto": target["round_upto"],
+            "summary_tokens": M.text_tokens(target["summary"] or ""),
+            "note": "已固定为当前 checkpoint：下一次请求即用它发送，后续压缩也在它之上继续"}
 
 
 PROMPT_LABELS = {
-    "batch_system": "批次摘要：把一段原文对话压成要点",
-    "recompress": "二次重压：累积摘要超过 cap 时逐片精简（按阈值分批，系统拼接）",
-    "injection": "注入给主模型的包装语（{summary} 是占位符，必须保留）",
+    "batch": "批次摘要：整条 user 消息发给摘要模型，{{context}} 处插入待压原文",
+    "recompress": "二次重压：累积摘要超过 cap 时逐片精简，{{context}} 处插入待精简摘要",
+    "injection": "注入给主模型的包装语（{{summary}} 是占位符，必须保留）",
     "fallback_notice": "定位兜底时追加的警告语",
 }
 
@@ -380,9 +429,11 @@ async def get_prompts(request: Request):
 
 @app.put("/admin/prompts")
 async def put_prompts(request: Request):
-    """保存提示词。写进数据库当覆盖项，不回写 config.yaml（那会把注释冲掉）。
+    """保存提示词，**直接写回 config.yaml**（只换提示词正文，文件里的注释原样保留）。
 
-    某条提交空字符串 = 删除该条覆盖，恢复成 config.yaml 里的值。
+    某条提交空字符串 = 恢复成内置默认值。
+    写文件失败时（只读挂载、权限不足）退回内存覆盖项，让这次修改仍然当场生效，
+    并在响应里说清楚"重启会丢"。
     """
     if (denied := _check_auth(request, admin=True)) is not None:
         return denied
@@ -392,28 +443,45 @@ async def put_prompts(request: Request):
         return JSONResponse(status_code=400, content={
             "error": {"message": "body 需要 {\"prompts\": {name: text}}"}})
 
-    current = config.prompt_overrides()
-    file_vals = config.cfg()["summary"]["prompts"]
+    to_write: dict[str, str] = {}
     for name, text in incoming.items():
         if name not in config.FALLBACK_PROMPTS:
             return JSONResponse(status_code=400, content={
                 "error": {"message": f"未知的提示词 {name!r}，可用：{list(config.FALLBACK_PROMPTS)}"}})
         text = text if isinstance(text, str) else ""
-        if not text.strip() or text.strip() == (file_vals.get(name) or "").strip():
-            current.pop(name, None)              # 和文件里一样就没必要留覆盖
-            continue
-        if name == "injection" and "{summary}" not in text:
-            return JSONResponse(status_code=400, content={"error": {"message":
-                "injection 里必须保留 {summary} 占位符，否则摘要不会被注入"}})
-        current[name] = text
+        if not text.strip():
+            text = config.FALLBACK_PROMPTS[name]      # 清空 = 恢复内置默认
+        if (err := config.check_prompt(name, text)) is not None:
+            return JSONResponse(status_code=400, content={"error": {"message": err}})
+        to_write[name] = config.normalize_prompt(name, text)
 
+    if not to_write:
+        return {"status": "saved", "written": [], "target": "config.yaml"}
+
+    try:
+        changed = await asyncio.to_thread(config.write_prompts_to_file, to_write)
+    except Exception as e:                            # noqa: BLE001 写不进去也得让改动生效
+        log.error("提示词回写 config.yaml 失败：%s；退回内存覆盖项（重启会丢）", e)
+        current = config.prompt_overrides()
+        current.update(to_write)
+        st = store.get()
+        if st.enabled:
+            await st.set_meta(PROMPT_OVERRIDE_KEY, json.dumps(current, ensure_ascii=False))
+        config.set_prompt_overrides(current)
+        return {"status": "saved_in_memory_only", "written": [],
+                "overridden": sorted(current),
+                "warning": f"写 config.yaml 失败（{e}）。改动已生效，但重启后会丢；"
+                           "检查文件权限后再保存一次"}
+
+    # 写进文件了，之前的内存覆盖项就该退场，否则它会一直盖住文件里的新值
     st = store.get()
     if st.enabled:
-        await st.set_meta(PROMPT_OVERRIDE_KEY, json.dumps(current, ensure_ascii=False))
-    config.set_prompt_overrides(current)
-    log.warning("提示词已更新：覆盖项 = %s（未回写 config.yaml）",
-                ", ".join(sorted(current)) or "无（全部恢复为文件值）")
-    return {"status": "saved", "overridden": sorted(current)}
+        await st.set_meta(PROMPT_OVERRIDE_KEY, "{}")
+    config.set_prompt_overrides({})
+    do_reload()
+    log.warning("提示词已写回 config.yaml：%s（已备份 config.yaml.bak）", ", ".join(sorted(changed)))
+    return {"status": "saved", "written": sorted(changed), "target": "config.yaml",
+            "note": "已写入配置文件并热重载，重启后依然生效；原文件备份在 config.yaml.bak"}
 
 
 @app.get("/admin/session/{conv_id}/timeline")

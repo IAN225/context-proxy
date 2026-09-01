@@ -155,9 +155,10 @@ nav button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
           <span class="spacer"></span>
           <button class="primary" id="savebtn" onclick="save()">保存摘要</button>
         </div>
-        <p class="muted small" style="margin:9px 0 0">
-          保存写成一条新的 manual checkpoint，原来那条留在链上可回退；下一次请求生效，
-          后续压缩在你写的内容之后追加。
+        <p class="muted small" style="margin:9px 0 0" id="sumhint"></p>
+        <p class="muted small" style="margin:6px 0 0">
+          保存写成一条新的 manual checkpoint 并固定为当前，原来那条留在链上可回退；
+          下一次请求生效，后续压缩在你写的内容之后追加。
         </p>
       </div>
 
@@ -250,10 +251,12 @@ async function refresh() {
   note("");
   try {
     const h = await (await fetch("/health")).json();
-    const fb = h.fallback_activations || 0, open = h.open_compression_events || 0;
+    const fb = h.fallback_activations || 0;
+    const busy = h.compressing_now || 0, todo = h.unfinished_compressions || 0;
     $("health").innerHTML =
       stat(h.conversations, "会话") + stat(h.checkpoints, "checkpoint") +
-      stat(open, "压缩中", open ? "var(--warn)" : null) +
+      stat(busy, "正在压缩", busy ? "var(--warn)" : null) +
+      stat(todo, "没压完", todo ? "var(--warn)" : null) +
       stat(fb, "定位兜底", fb ? "var(--danger)" : null) +
       stat(h.trigger_tokens, "触发阈值") +
       stat(h.keep_recent_tokens_effective, "近期原文下限");
@@ -284,20 +287,34 @@ async function open_session(cid) {
       stat(s.compressed_upto, "压缩到的下标") +
       stat(d.checkpoints.length, "checkpoint") +
       stat(s.base_seq, "当前 seq") +
-      (s.editable ? "" : stat("压缩中", "暂不可保存", "var(--warn)"));
+      (s.busy ? stat("压缩中", "暂不可保存", "var(--warn)") : "") +
+      (s.unfinished_event_seq != null
+        ? stat("seq " + s.unfinished_event_seq, "上次没压完", "var(--warn)") : "");
     $("sum").value = s.summary;
     $("sum").dataset.base = s.base_seq;
     $("savebtn").disabled = !s.editable;
+    $("sumhint").textContent = s.busy
+      ? "这个会话此刻有请求在跑，等它结束再改。"
+      : (s.unfinished_event_seq != null
+          ? `上次压缩没压完（事件 seq ${s.unfinished_event_seq}），这是静止状态、不影响编辑；`
+            + "保存后那个半成品会作废，下次请求从你这条继续压。"
+          : "保存即固定为当前 checkpoint，下一次请求就用它，重启后依然是它。");
     $("d_tok").textContent = `${s.summary_tokens} / ${s.summary_cap_tokens} tokens`;
+    const cur = d.checkpoints.length ? Math.max(...d.checkpoints.map(c => c.seq)) : null;
     $("cks").innerHTML = d.checkpoints.map(c => `
       <div class="item" style="cursor:default">
         <div class="top"><b>seq ${c.seq}</b>
           <span class="pill ${c.kind === "manual" ? "on" : c.kind === "fallback" ? "bad" : ""}">${esc(c.kind)}</span>
-          ${c.pinned ? '<span class="pill">置顶</span>' : ""}
-          ${c.status === "partial" ? '<span class="pill warn">partial</span>' : ""}</div>
+          ${c.seq === cur ? '<span class="pill on">当前</span>' : ""}
+          ${c.pinned === 2 ? '<span class="pill on">手工固定</span>' : c.pinned ? '<span class="pill">置顶</span>' : ""}
+          ${c.status === "partial" ? '<span class="pill warn">没压完</span>' : ""}
+          ${c.status === "stale" ? '<span class="pill">已作废</span>' : ""}</div>
         <div class="meta">第 ${c.round_upto} 轮 / 下标 ${c.compressed_upto} ·
           ${c.summary_tokens} tokens · 指纹 ${c.signature_len ?? "无"}</div>
         <div class="meta">${new Date(c.updated_at * 1000).toLocaleString()}</div>
+        ${c.seq === cur || !c.summary_tokens ? "" :
+          `<button class="ghost" style="margin-top:8px;width:100%"
+             onclick="activate(${c.seq}, ${c.round_upto})">设为当前摘要</button>`}
       </div>`).join("");
   } catch (e) { note(e.message); }
 }
@@ -314,6 +331,17 @@ async function save() {
     });
     const ok = `已保存：seq ${r.base_seq} → ${r.new_seq}，${r.previous_summary_tokens} → ${r.summary_tokens} tokens。下一次请求生效。`;
     await refresh(); note(ok, "ok");
+  } catch (e) { note(e.message); }
+}
+
+async function activate(seq, round_upto) {
+  if (!confirm(`把 seq ${seq} 的摘要设为当前摘要？\n\n`
+      + `之后发给模型的、以及继续压缩所基于的都是它（已压到第 ${round_upto} 轮）。\n`
+      + "这条会被固定住，重启也不会变回去；更晚的 checkpoint 仍然留着，可以再选回去。")) return;
+  try {
+    const r = await api(`/admin/session/${CUR}/checkpoint/${seq}/activate`, {method: "POST"});
+    await refresh();
+    note(`已固定 seq ${r.from_seq} 为当前摘要（新 seq ${r.new_seq}，第 ${r.round_upto} 轮）`, "ok");
   } catch (e) { note(e.message); }
 }
 
@@ -373,18 +401,24 @@ function more_timeline() { TL_SHOWN = Math.min(TL.rounds.length, TL_SHOWN + PAGE
 async function load_prompts() {
   try {
     const d = await api("/admin/prompts");
-    $("prompts").innerHTML = d.prompts.map((p, i) => `
+    $("prompts").innerHTML =
+      `<div class="card"><p class="muted small" style="margin:0">
+         保存会<b>直接写回 config.yaml</b>（只替换正文，文件里的注释原样保留，
+         原文件备份成 config.yaml.bak），保存后立即热重载，重启依然生效。
+       </p></div>` +
+      d.prompts.map((p, i) => `
       <div class="card">
         <div class="row" style="margin-bottom:8px">
           <h2>${esc(p.label)}</h2><span class="spacer"></span>
-          <span class="pill ${p.overridden ? "on" : ""}">${p.overridden ? "已改" : "配置文件"}</span>
+          ${p.overridden ? '<span class="pill warn">仅内存</span>' : '<span class="pill">config.yaml</span>'}
         </div>
-        <div class="mono muted small" style="margin-bottom:6px">${esc(p.name)}</div>
+        <div class="mono muted small" style="margin-bottom:6px">${esc(p.name)}${
+          p.requires && p.requires.length ? " · 必须包含 " + esc(p.requires[0]) : ""}</div>
         <textarea id="pr_${i}" rows="10" spellcheck="false">${esc(p.effective)}</textarea>
         <div class="row" style="margin-top:10px">
-          <button onclick="reset_prompt(${i})" ${p.overridden ? "" : "disabled"}>恢复文件里的值</button>
+          <button onclick="reset_prompt(${i})">恢复默认</button>
           <span class="spacer"></span>
-          <button class="primary" onclick="save_prompt(${i})">保存</button>
+          <button class="primary" onclick="save_prompt(${i})">保存到 config.yaml</button>
         </div>
       </div>`).join("");
     window._prompts = d.prompts;
@@ -393,17 +427,20 @@ async function load_prompts() {
 
 async function put_prompts(body, okmsg) {
   try {
-    await api("/admin/prompts", {method: "PUT", body: JSON.stringify({prompts: body})});
-    await load_prompts(); note(okmsg, "ok");
+    const r = await api("/admin/prompts", {method: "PUT", body: JSON.stringify({prompts: body})});
+    await load_prompts();
+    note(r.warning ? r.warning : okmsg, r.warning ? "err" : "ok");
   } catch (e) { note(e.message); }
 }
 function save_prompt(i) {
   const p = window._prompts[i];
-  put_prompts({[p.name]: $("pr_" + i).value}, `已保存「${p.label}」，下一次压缩生效。`);
+  put_prompts({[p.name]: $("pr_" + i).value},
+              `已把「${p.label}」写回 config.yaml，下一次压缩生效。`);
 }
 function reset_prompt(i) {
   const p = window._prompts[i];
-  put_prompts({[p.name]: ""}, `「${p.label}」已恢复成 config.yaml 里的值。`);
+  if (!confirm(`把「${p.label}」恢复成内置默认值并写回 config.yaml？`)) return;
+  put_prompts({[p.name]: ""}, `「${p.label}」已恢复成默认值并写回 config.yaml。`);
 }
 
 $("key").addEventListener("keydown", e => { if (e.key === "Enter") login(); });

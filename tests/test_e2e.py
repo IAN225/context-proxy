@@ -50,6 +50,9 @@ BASE_SUMMARY = {
 
 UI_TOKEN = "uiTOKEN0123456789"
 
+# 默认提示词模板里正文前的那句话（测试配置不写 prompts，走内置默认值）
+CONTEXT_MARK = "以下是待压片段"
+
 
 def write_config(db_name: str, ui_token: str = "", **summary_overrides) -> None:
     cfg = {
@@ -77,6 +80,7 @@ import uvicorn  # noqa: E402
 
 import mock_upstream  # noqa: E402
 from cproxy import app as app_module  # noqa: E402
+from cproxy import config as config_mod  # noqa: E402
 
 app_module.bootstrap()
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}
@@ -213,7 +217,7 @@ def test_incremental_progress_never_restarts_from_zero():
     assert s["compressed_upto"] > upto1, "增量压缩应当推进，而不是从 0 重来"
     assert s["round_upto"] > 0
     # 第二次压缩的输入不该覆盖已压过的早期内容
-    assert all(c["n_messages"] >= 2 for c in summary_calls())
+    assert all("第0轮提问" not in c["prompt"] for c in summary_calls()[1:])
 
 
 def test_edit_recent_message_does_not_trigger_full_recompress():
@@ -348,8 +352,7 @@ def test_tool_call_rounds_are_never_split():
     # 送进摘要模型的每一批也都从 user 开始、以 assistant 收束，
     # 即批边界只落在轮边界上，工具调用四件套不会被拆散
     for c in summary_calls():
-        transcript = c["prompt"].split("=== 对话片段开始 ===", 1)[-1].strip()
-        transcript = transcript.split("=== 对话片段结束 ===", 1)[0].strip()
+        transcript = c["prompt"].split(CONTEXT_MARK, 1)[-1].strip()
         blocks = [b for b in transcript.split("\n\n") if b.startswith("[")]
         assert blocks[0].startswith("[user]:"), blocks[0][:80]
         assert blocks[-1].startswith("[assistant]:"), blocks[-1][:80]
@@ -475,7 +478,7 @@ def test_recompress_writes_new_checkpoint_and_keeps_history():
     assert "recompress" in kinds, kinds
     assert any(c["pinned"] for c in detail["checkpoints"]), "最早的 checkpoint 必须永久保留"
     # 二次重压和批次摘要同构：按阈值分批 + 系统拼接，没有额外的"合并成稿"调用
-    recompress_calls = [c for c in summary_calls() if "需要精简的摘要内容" in c["prompt"]]
+    recompress_calls = [c for c in summary_calls() if "无损精简" in c["prompt"]]
     assert recompress_calls, "应当调过二次重压"
     assert not any("合并" in c["prompt"] for c in summary_calls()), "不该再有单独的合并调用"
     merged = _summary_api(sessions()[0]["conv_id"]).json()["summary"]
@@ -928,13 +931,115 @@ def test_manual_summary_rejects_stale_base_seq_and_open_event():
     assert r.status_code == 409 and "已被更新" in r.json()["error"]["message"]
     assert _summary_api(cid).json()["summary"] == "改动一"
 
-    # 压缩事件没收尾时拒绝编辑
+
+def test_unfinished_compression_does_not_block_editing():
+    """上次没压完（partial）是静止状态，不是"正在压缩"——不能因此永久锁住编辑。
+
+    这正是用户遇到的现象：中转站报错/批次上限没压完之后，页面一直显示压缩中、改不了摘要。
+    """
     fresh(max_batches_per_request=1)
-    post("mm", convo(60))
-    cid2 = sessions()[0]["conv_id"]
-    assert _summary_api(cid2).json()["editable"] is False
-    r = _put_summary(cid2, "趁着压缩没完偷偷改")
-    assert r.status_code == 409 and "正在压缩中" in r.json()["error"]["message"]
+    # 只压一批就返回：闸门会拦下这次请求（503），但已压的那批照样落盘，
+    # 留下一条 partial —— 用户遇到的就是这个状态
+    r = post("mm", convo(60))
+    assert r.status_code == 503 and r.json()["error"]["detail"]["progress_saved"] is True
+    cid = sessions()[0]["conv_id"]
+
+    got = _summary_api(cid).json()
+    assert got["status"] == "partial", "构造的就是没压完的状态"
+    assert got["unfinished_event_seq"] is not None
+    assert got["busy"] is False, "没有请求在跑，就不该说忙"
+    assert got["editable"] is True, "没压完 ≠ 正在压缩，必须能改"
+
+    r = _put_summary(cid, "## 关键事实\n手工写死的摘要", base_seq=got["base_seq"])
+    assert r.status_code == 200, r.text
+    after = _summary_api(cid).json()
+    assert after["summary"].startswith("## 关键事实")
+    # 半成品被作废了：不作废的话下次请求会绕回去接着压它，把手工摘要甩掉
+    assert after["unfinished_event_seq"] is None
+    stale = [c for c in session_detail(cid)["checkpoints"] if c["status"] == "stale"]
+    assert stale, [c["status"] for c in session_detail(cid)["checkpoints"]]
+
+
+def test_health_separates_running_from_unfinished():
+    fresh(max_batches_per_request=1)
+    assert post("mm", convo(60)).status_code == 503      # 没压完，进度已落盘
+    h = httpx.get(f"{PROXY}/health", timeout=5).json()
+    assert h["unfinished_compressions"] >= 1
+    assert h["compressing_now"] == 0, "请求已经返回了，不该还算在「正在压缩」里"
+
+
+def _activate(conv_id, seq):
+    return httpx.post(f"{PROXY}/admin/session/{conv_id}/checkpoint/{seq}/activate",
+                      headers=admin_h(), timeout=10)
+
+
+def test_activate_old_checkpoint_becomes_the_live_summary():
+    """把某条历史 checkpoint 设为当前：立刻用于发送，也用于后续继续压缩。"""
+    fresh()
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    first = _summary_api(cid).json()
+    assert first["base_seq"] == 1
+
+    # 制造第二条 checkpoint，让链上有多条可选
+    assert _put_summary(cid, "## 关键事实\n第二版摘要", base_seq=first["base_seq"]).status_code == 200
+    assert _summary_api(cid).json()["summary"].startswith("## 关键事实\n第二版")
+
+    # 回到第 1 条
+    r = _activate(cid, 1)
+    assert r.status_code == 200, r.text
+    assert r.json()["from_seq"] == 1 and r.json()["new_seq"] == 3
+    live = _summary_api(cid).json()
+    assert live["summary"] == first["summary"], "当前生效的应当是被指定的那条"
+    assert live["base_seq"] == 3 and live["kind"] == "manual" and live["pinned"] == 2
+
+    # 更晚的那条还在链上，可以再选回去
+    seqs = {c["seq"] for c in session_detail(cid)["checkpoints"]}
+    assert {1, 2, 3} <= seqs, seqs
+    assert _activate(cid, 2).status_code == 200
+    assert _summary_api(cid).json()["summary"].startswith("## 关键事实\n第二版")
+
+    # 实际发出去的也换了：再发一条消息，上游收到的注入摘要就是它
+    assert post("mm", convo(31)).status_code == 200
+    assert "第二版摘要" in (chat_calls()[-1]["injected_summary"] or ""), \
+        chat_calls()[-1]["injected_summary"]
+
+
+def test_activated_checkpoint_survives_restart_and_further_compression():
+    """长期生效：重启（重开库）之后仍然是它，后续压缩也在它之上追加。"""
+    fresh(max_batches_per_request=2)
+    assert post("mm", convo(40)).status_code in (200, 503)
+    cid = sessions()[0]["conv_id"]
+
+    hand = "## 关键事实与专有名词\n- 这条是人写的，必须一直生效"
+    got = _summary_api(cid).json()
+    assert _put_summary(cid, hand, base_seq=got["base_seq"]).status_code == 200
+    pinned_seq = _summary_api(cid).json()["base_seq"]
+
+    # 重开数据库 = 进程重启后的状态
+    app_module.do_reload()
+    after = _summary_api(cid).json()
+    assert after["base_seq"] == pinned_seq and after["summary"] == hand
+    assert after["unfinished_event_seq"] is None, "半成品已作废，不该再被续压"
+
+    # 后续压缩在它之上追加，而不是绕回系统自动压的那条
+    for _ in range(6):
+        if post("mm", convo(40)).status_code == 200:
+            break
+    now = _summary_api(cid).json()["summary"]
+    assert now.startswith(hand), now[:200]
+
+    # 手工那条永远留在链上（不会被 checkpoint_keep 裁掉）
+    cks = session_detail(cid)["checkpoints"]
+    assert any(c["seq"] == pinned_seq for c in cks), [c["seq"] for c in cks]
+
+
+def test_activate_rejects_unknown_or_empty_checkpoint():
+    fresh()
+    assert post("mm", convo(30)).status_code == 200
+    cid = sessions()[0]["conv_id"]
+    r = _activate(cid, 999)
+    assert r.status_code == 404 and "没有 seq=999" in r.json()["error"]["message"]
 
 
 def test_manual_summary_rejects_empty_and_over_cap():
@@ -1058,37 +1163,96 @@ def test_ui_summary_edit_flow_through_admin_api():
 
 # ---- 提示词读写 ----
 
-def test_prompt_edit_takes_effect_and_can_be_reset():
+def test_prompt_edit_writes_back_to_config_file():
+    """页面上保存 = 直接写回 config.yaml，重启后依然生效。"""
     fresh(ui_token=UI_TOKEN)
     got = httpx.get(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5).json()["prompts"]
     names = {p["name"] for p in got}
-    assert names == {"batch_system", "recompress", "injection", "fallback_notice"}
+    assert names == {"batch", "recompress", "injection", "fallback_notice"}
     assert all(p["overridden"] is False for p in got)
 
     mark = "【这是页面上改的批次摘要提示词】"
     r = httpx.put(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5,
-                  json={"prompts": {"batch_system": mark + "请压缩下面的对话。"}})
-    assert r.status_code == 200 and r.json()["overridden"] == ["batch_system"]
+                  json={"prompts": {"batch": mark + "请压缩下面的对话。\n\n以下是待压片段\n{{context}}"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["written"] == ["batch"] and r.json()["target"] == "config.yaml"
 
-    # 下一次压缩就用改过的提示词
+    # 真的落到文件里了，而不是只在内存
+    on_disk = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    assert mark in on_disk["summary"]["prompts"]["batch"]
+    assert (CFG_PATH.parent / (CFG_PATH.name + ".bak")).exists(), "改配置前要留一份备份"
+
+    # 下一次压缩就用改过的提示词，而且整条走 user 角色
     assert post("mm", convo(30)).status_code == 200
-    assert any(mark in c.get("system_preview", "") for c in summary_calls()), \
-        [c.get("system_preview") for c in summary_calls()][:2]
+    sc = summary_calls()
+    assert sc and all(c["roles"] == ["user"] for c in sc), [c["roles"] for c in sc]
+    assert all(c["prompt"].startswith(mark) for c in sc), sc[0]["prompt"][:120]
+    assert all(CONTEXT_MARK in c["prompt"] and "【第" in c["prompt"] for c in sc)
 
-    # 覆盖项跨热重载存活（存在 DB 里，不回写 config.yaml）
+    # 热重载后仍然是文件里的值（不再依赖内存覆盖项）
     app_module.do_reload()
     after = {p["name"]: p for p in
              httpx.get(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5).json()["prompts"]}
-    assert after["batch_system"]["overridden"] is True
-    assert mark in after["batch_system"]["effective"]
-    assert mark not in after["batch_system"]["from_file"], "config.yaml 不该被回写"
+    assert after["batch"]["overridden"] is False, "写进文件之后就不该再挂内存覆盖项"
+    assert mark in after["batch"]["from_file"] and mark in after["batch"]["effective"]
 
-    # 提交空字符串 = 恢复文件里的值
+    # 提交空字符串 = 恢复内置默认值，同样写回文件
     httpx.put(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5,
-              json={"prompts": {"batch_system": ""}})
-    back = {p["name"]: p for p in
-            httpx.get(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5).json()["prompts"]}
-    assert back["batch_system"]["overridden"] is False
+              json={"prompts": {"batch": ""}})
+    back = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))["summary"]["prompts"]["batch"]
+    assert mark not in back and "{{context}}" in back
+
+
+def test_prompt_write_back_keeps_comments_and_other_keys():
+    """只换提示词正文，文件里的注释和别的配置一字不动。"""
+    fresh(ui_token=UI_TOKEN)
+    raw = CFG_PATH.read_text(encoding="utf-8")
+    CFG_PATH.write_text(raw.replace("summary:\n", "# 一条不能被冲掉的注释\nsummary:\n", 1),
+                        encoding="utf-8")
+    app_module.do_reload()
+
+    r = httpx.put(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5,
+                  json={"prompts": {"recompress": "精简一下\n\n以下是待压片段\n{{context}}"}})
+    assert r.status_code == 200, r.text
+    text = CFG_PATH.read_text(encoding="utf-8")
+    assert "# 一条不能被冲掉的注释" in text
+    cfg = yaml.safe_load(text)
+    assert cfg["summary"]["prompts"]["recompress"].startswith("精简一下")
+    assert "batch" not in cfg["summary"]["prompts"], "只写改的那条，其余仍走内置默认值"
+    assert cfg["server"]["auth_token"] == TOKEN and cfg["providers"][0]["name"] == "mm"
+    eff = {p["name"]: p for p in
+           httpx.get(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5).json()["prompts"]}
+    assert eff["batch"]["effective"] == config_mod.FALLBACK_PROMPTS["batch"]
+
+
+def test_prompt_without_context_placeholder_is_rejected():
+    fresh(ui_token=UI_TOKEN)
+    r = httpx.put(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5,
+                  json={"prompts": {"batch": "压缩一下这段对话"}})
+    assert r.status_code == 400 and "{{context}}" in r.json()["error"]["message"]
+
+
+def test_legacy_batch_system_prompt_is_migrated():
+    """旧配置里的 batch_system（走 system 角色、没有占位符）要能自动升级。"""
+    _counter["n"] += 1
+    write_config(f"db/lg{_counter['n']}.db", ui_token=UI_TOKEN)
+    cfg = yaml.safe_load(CFG_PATH.read_text(encoding="utf-8"))
+    cfg["summary"]["prompts"] = {"batch_system": "老提示词：把对话压成要点"}
+    CFG_PATH.write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    _set_admin_token(UI_TOKEN)
+    app_module.do_reload()
+    httpx.post(f"{MOCK}/__reset", timeout=5)
+
+    got = {p["name"]: p for p in
+           httpx.get(f"{PROXY}/admin/prompts", headers=admin_h(), timeout=5).json()["prompts"]}
+    assert "batch_system" not in got
+    assert got["batch"]["effective"].startswith("老提示词")
+    assert "{{context}}" in got["batch"]["effective"], "缺占位符要自动补上，否则正文会丢"
+
+    assert post("mm", convo(30)).status_code == 200
+    sc = summary_calls()
+    assert sc and all(c["roles"] == ["user"] for c in sc)
+    assert all(c["prompt"].startswith("老提示词") and "【第" in c["prompt"] for c in sc)
 
 
 def test_injection_prompt_must_keep_placeholder():
@@ -1187,8 +1351,8 @@ def test_summary_model_extra_body_applies():
     s = summary_calls()[0]
     assert s["extra"]["temperature"] == 0.5
     assert s["extra"]["enable_thinking"] is False
-    # 骨架字段不受影响
-    assert s["n_messages"] == 2 and s["stream"] is False
+    # 骨架字段不受影响：提示词整条走 user，所以只有一条消息
+    assert s["n_messages"] == 1 and s["roles"] == ["user"] and s["stream"] is False
 
 
 def test_headers_are_not_forwarded_unless_whitelisted():
